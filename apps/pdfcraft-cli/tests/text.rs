@@ -96,6 +96,82 @@ fn text_of_a_protected_document_with_the_password_succeeds() {
     assert!(stdout.contains("Page 1") && stdout.contains("Page 3"), "{stdout}");
 }
 
+mod copy_permissions {
+    use super::*;
+    use pdfcraft_cos::{Algorithm, Document, NewEncryption, SaveOptions, write_full};
+    use std::sync::Arc;
+
+    const ALGORITHMS: [Algorithm; 4] = [Algorithm::Rc4_40, Algorithm::Rc4_128, Algorithm::Aes128, Algorithm::Aes256];
+
+    fn encrypted(tag: &str, algorithm: Algorithm, user_password: &str, copy: bool) -> std::path::PathBuf {
+        let mut doc = Document::open(Arc::new(fixture(3))).unwrap();
+        doc.set_encryption(&NewEncryption {
+            algorithm,
+            user_password,
+            owner_password: "permissions",
+            // Accessibility remains permitted independently of ordinary extraction.
+            permissions: (1 << 9) | if copy { 1 << 4 } else { 0 },
+            encrypt_metadata: true,
+            seed: [17; 32],
+        })
+        .unwrap();
+        let path = tmp(&format!("copy-{tag}-{algorithm:?}.pdf"));
+        std::fs::write(&path, write_full(&doc, &SaveOptions::default()).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn restricted_text_is_refused_before_any_page_is_printed() {
+        for algorithm in ALGORITHMS {
+            for user_password in ["", "openme"] {
+                let path = encrypted(if user_password.is_empty() { "empty-user" } else { "user" }, algorithm, user_password, false);
+                let bytes = std::fs::read(&path).unwrap();
+                let doc = Document::open_with_password(Arc::new(bytes.clone()), Some(user_password)).unwrap();
+                assert!(!doc.permissions().unwrap().copy());
+                assert!(doc.permissions().unwrap().extract_for_accessibility());
+                for selected in [false, true] {
+                    let mut command = Command::new(BIN);
+                    command.arg("text").arg(&path);
+                    if !user_password.is_empty() {
+                        command.args(["--password", user_password]);
+                    }
+                    if selected {
+                        command.args(["--page", "2"]);
+                    }
+                    let out = command.output().unwrap();
+                    assert_eq!(out.status.code(), Some(1), "{algorithm:?}, selected={selected}: {out:?}");
+                    assert!(out.stdout.is_empty(), "restricted text leaked: {}", String::from_utf8_lossy(&out.stdout));
+                    let error = String::from_utf8_lossy(&out.stderr);
+                    assert!(error.contains("copying text and images"), "{error}");
+                    assert!(!error.contains("openme") && !error.contains("permissions"));
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn user_access_with_copy_permission_still_extracts_text() {
+        for algorithm in ALGORITHMS {
+            let path = encrypted("allowed-user", algorithm, "openme", true);
+            let out = Command::new(BIN).arg("text").arg(path).args(["--password", "openme", "--page", "2"]).output().unwrap();
+            assert!(out.status.success(), "{algorithm:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Page 2");
+            assert!(out.stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn owner_access_still_extracts_copy_restricted_text() {
+        let path = encrypted("owner", Algorithm::Aes256, "openme", false);
+        let out = Command::new(BIN).arg("text").arg(path).args(["--password", "permissions"]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("Page 1") && text.contains("Page 3"), "{text}");
+        assert!(out.stderr.is_empty());
+    }
+}
+
 mod page_argument_tests {
     use super::*;
     use std::path::PathBuf;

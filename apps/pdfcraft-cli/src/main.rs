@@ -326,6 +326,12 @@ fn text(args: &[String]) -> Result<(), CliError> {
     }
     let password = flag(args, "--password");
     let bytes = read(path)?;
+    let permissions = pdfcraft_engine::guard(|| pdfcraft_cos::Document::open_with_password(bytes.clone(), password).map(|doc| doc.permissions()))
+        .map_err(|e| format!("text: {e}"))?
+        .map_err(|e| format!("text: {e}"))?;
+    if permissions.is_some_and(|permissions| !permissions.copy()) {
+        return Err(pdfcraft_engine::EditError::NotPermitted("copying text and images").to_string().into());
+    }
     let mut r = PageRenderer::new(bytes.clone(), RenderConfig { password: password.map(Arc::from), ..Default::default() });
     // A document the renderer could not open (wrong or missing password, unparseable file) has
     // no pages, and "extract every page" of nothing would print nothing and exit 0 (#132). Ask
