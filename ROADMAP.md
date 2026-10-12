@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~26% (ready for real work 49% → 75%) and ~400–700 h away
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (M1 #1339: an unchanged incremental save of a classic cross-reference table writes a zero-length subsection; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (M6 XML field names; M1 #1339: an unchanged incremental save of a classic cross-reference table writes a zero-length subsection; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (M14 Windows low-DPI font-hinting candidate measured on macOS; no Windows runtime claim; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (M3: Windows' Animation effects setting is followed, and Preferences has Animation effects: system, on or off); earlier: exclusive image-crop resize follow-up; M2 short same-line redraws split before placement; estimates unchanged · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (M7 #1200 candidate: local GoToR links and confined automation; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
@@ -175,6 +175,8 @@ Ranked; detail and the full milestone table in [docs/roadmap.md](docs/roadmap.md
 - **2026-10-11 (M7, contributor fork):** Join compatible words across text objects and subset-font spaces; preserve source fonts that lack a space glyph using text positioning; recognize component colour operators. Inline editing uses one editor frame, resets its available width when switching blocks, keeps source line breaks, and renders a COS-clone background without the original glyphs, preserving unselected text advances. `page_render.hide_text_block` exposes the same read-only preview. Mixed-style paragraph grouping, installed-font selection and exact source-font editor rendering remain open.
 
 Newest first: the date, what moved, and the new overall estimate.
+
+- **2026-10-12 (M6, XML field names):** AcroForm XML data export constrains generated element names to XML 1.0 NCNames, so Latin-1 names such as `Area²` and `Aµ` produce readable data files. Original PDF field names travel through the existing `xfdf:original` attribute; previously valid tags, including Greek and CJK, keep their spelling. Saved-PDF regressions cover invalid prefixes, combining letters and normalized-name collisions. Estimates unchanged.
 
 - 2026-10-11: Organize Pages shows an editable, synchronized physical page-range selection (#1092), with bounded validation and UI/operation regression coverage; overall estimate unchanged.
 
@@ -403,6 +405,7 @@ Newest first: the date, what moved, and the new overall estimate.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-12 | minor | M6: valid AcroForm XML element names with original PDF field names preserved; saved-PDF collision and Unicode regressions. Estimates unchanged. |
 | 2026-10-12 | minor | M7/#1200 candidate: bounded local GoToR opening, root-confined automation, and action-preserving appearance edits; named destinations and window behavior remain partial; estimates unchanged. |
 | 2026-10-12 | minor | Exclusive image crops resize with their pixels across nested states, intervening operators and content streams; shared clips remain fixed. Synthetic engine/tool regressions and private image save/reopen checks; estimates unchanged. |
 | 2026-10-11 | minor | M10: borderless inferred tables and positioned invoice watermarks (#773); estimates unchanged. |
