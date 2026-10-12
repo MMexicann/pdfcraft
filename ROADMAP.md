@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~26% (ready for real work 49% → 75%) and ~400–700 h away
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (M1 #1339: an unchanged incremental save of a classic cross-reference table writes a zero-length subsection; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (M2: preserve unfiltered inline-image pixels resembling EI; M1 #1339: an unchanged incremental save of a classic cross-reference table writes a zero-length subsection; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (M14 Windows low-DPI font-hinting candidate measured on macOS; no Windows runtime claim; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (M3: Windows' Animation effects setting is followed, and Preferences has Animation effects: system, on or off); earlier: exclusive image-crop resize follow-up; M2 short same-line redraws split before placement; estimates unchanged · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (M7 #1200 candidate: local GoToR links and confined automation; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
@@ -175,6 +175,8 @@ Ranked; detail and the full milestone table in [docs/roadmap.md](docs/roadmap.md
 - **2026-10-11 (M7, contributor fork):** Join compatible words across text objects and subset-font spaces; preserve source fonts that lack a space glyph using text positioning; recognize component colour operators. Inline editing uses one editor frame, resets its available width when switching blocks, keeps source line breaks, and renders a COS-clone background without the original glyphs, preserving unselected text advances. `page_render.hide_text_block` exposes the same read-only preview. Mixed-style paragraph grouping, installed-font selection and exact source-font editor rendering remain open.
 
 Newest first: the date, what moved, and the new overall estimate.
+
+- **2026-10-12 (M2, inline-image boundaries):** Unfiltered inline images with known sample layouts keep pixel bytes that look like the `EI` terminator when content is rewritten. Regression tests cover row padding, colour-space and parameter aliases, masks and malformed sizes; classic and packed saved PDFs retain the pixels in independent readers and renderers. Filtered and resource-defined layouts retain the existing tolerant heuristic. Estimates unchanged.
 
 - 2026-10-11: Organize Pages shows an editable, synchronized physical page-range selection (#1092), with bounded validation and UI/operation regression coverage; overall estimate unchanged.
 
@@ -403,6 +405,7 @@ Newest first: the date, what moved, and the new overall estimate.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-12 | minor | M2: preserve whitespace-bounded EI bytes in known unfiltered inline images; row padding, masks and aliases tested, with independent saved-PDF pixel checks. Estimates unchanged. |
 | 2026-10-12 | minor | M7/#1200 candidate: bounded local GoToR opening, root-confined automation, and action-preserving appearance edits; named destinations and window behavior remain partial; estimates unchanged. |
 | 2026-10-12 | minor | Exclusive image crops resize with their pixels across nested states, intervening operators and content streams; shared clips remain fixed. Synthetic engine/tool regressions and private image save/reopen checks; estimates unchanged. |
 | 2026-10-11 | minor | M10: borderless inferred tables and positioned invoice watermarks (#773); estimates unchanged. |
