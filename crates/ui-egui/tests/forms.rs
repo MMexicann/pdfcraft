@@ -146,6 +146,34 @@ fn date_fields_offer_a_calendar() {
     assert_eq!(value(&h, "due"), vec![format!("{nm:02}/15/{ny}")], "picked in the field's format");
 }
 
+#[test]
+fn lithuanian_calendar_localizes_months_and_weekdays_without_changing_field_values() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = harness();
+    h.state_mut().set_option("language", "lt").unwrap();
+    h.state_mut().apply_edit(pdfcraft_engine::Edit::AddField {
+        page: 0,
+        rect: [50.0, 40.0, 200.0, 60.0],
+        kind: pdfcraft_engine::NewField::Date,
+        name: Some("due".into()),
+    });
+    h.run_steps(4);
+    click_field(&mut h, "due", 0);
+    let (y, m, _) = h.state().session.today();
+    let months = ["sausis", "vasaris", "kovas", "balandis", "gegužė", "birželis", "liepa", "rugpjūtis", "rugsėjis", "spalis", "lapkritis", "gruodis"];
+    h.get_by_label(&format!("{y} m. {}", months[(m - 1) as usize]));
+    for day in ["Sk", "Pr", "An", "Tr", "Kt", "Pn", "Št"] {
+        h.get_by_label(day);
+    }
+    h.get_by_label("›").click();
+    h.run_steps(2);
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    h.get_by_label(&format!("{ny} m. {}", months[(nm - 1) as usize]));
+    h.get_by_label("15").click();
+    h.run_steps(4);
+    assert_eq!(value(&h, "due"), vec![format!("{nm:02}/15/{ny}")], "the PDF field keeps its own date format");
+}
+
 /// The value of `name` in a saved PDF, read back by opening it in a fresh app.
 fn saved_value(path: &std::path::Path, name: &str) -> Vec<String> {
     let mut app = PdfCraftApp::new();
@@ -649,4 +677,27 @@ fn overlay_clears_after_fresh_tiles_zoom_then_edit_and_rejected_edit() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(!h.state().views[0].forms.unbaked.contains(&("name".to_string(), 0)));
+}
+
+/// A field whose /P is a page number past the document's end (#1307) is listed under
+/// "Unplaced" instead of panicking while the Fields panel labels its page.
+#[test]
+fn the_fields_panel_lists_a_field_on_a_missing_page_as_unplaced() {
+    use egui_kittest::kittest::Queryable;
+    let bytes = pdf_from_objects(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Annots [4 0 R] >>",
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (orphan) /Rect [10 10 100 30] /P 99 /F 4 >>",
+    ]);
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("orphan.pdf", None, bytes).unwrap();
+        app.set_option("panel", "fields").unwrap();
+        app
+    });
+    h.run_steps(6);
+    h.get_by_label("Unplaced");
+    assert_eq!(h.query_all_by_label("orphan").count(), 1);
 }

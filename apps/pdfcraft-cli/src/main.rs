@@ -428,6 +428,17 @@ fn edit(args: &[String]) -> Result<(), CliError> {
     let mut session = Session::new();
     let id = session.open(path, Some(path.to_string()), read(path)?, password).map_err(|e| e.to_string())?;
     for e in edits {
+        // A destination past the end must fail like `page_move` / `page_insert_blank` do, not
+        // silently become an append (#1330). Checked per edit: earlier edits change the count.
+        let n = session.get(id).map_or(0, |d| d.info.pages.len());
+        let destination = match &e {
+            Edit::MovePages { to, .. } => Some(("--move target", *to)),
+            Edit::InsertBlankPage { at, .. } => Some(("--insert-blank", *at)),
+            _ => None,
+        };
+        if let Some((option, at)) = destination.filter(|(_, at)| *at > n) {
+            return Err(format!("{option} {} is past the end: it must be between 1 and {} (the document has {n} pages)", at + 1, n + 1).into());
+        }
         session.apply(id, e).map_err(|e| e.to_string())?;
     }
     let bytes = if full { session.save_full_bytes(id) } else { session.save_bytes(id) }.map_err(|e| e.to_string())?;

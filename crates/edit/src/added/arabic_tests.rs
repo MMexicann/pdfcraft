@@ -152,7 +152,8 @@ fn an_item_below_the_old_limit_is_drawn_exactly_as_before() {
     assert_eq!(fonts.len(), 1);
     // The injected outlines are fixed; only the descriptor's family comes from craft-fonts.
     // Check that metadata separately, then normalize those two fields to the original golden.
-    // The drawing bytes and semantic object fields must match in both font build modes.
+    // ActualText is new metadata: check each line's value and remove only its added wrappers
+    // before hashing. Drawing bytes and font objects still match the original golden exactly.
     let family = pdfcraft_fonts::document_arabic_font().map_or("Arabic", |face| face.family);
     for (_, font) in fonts.iter() {
         let descriptor = doc.dict(font).unwrap().get(b"FontDescriptor").and_then(Object::as_ref).unwrap();
@@ -166,6 +167,14 @@ fn an_item_below_the_old_limit_is_drawn_exactly_as_before() {
         .unwrap();
     }
     let mut bytes = out.clone();
+    for (line, ..) in &laid {
+        let hex: String = line.encode_utf16().map(|u| format!("{u:04X}")).collect();
+        let header = format!("/Span <</ActualText <FEFF{hex}>>> BDC\n").into_bytes();
+        let start = bytes.windows(header.len()).position(|w| w == header).expect("each line has its logical text");
+        bytes.drain(start..start + header.len());
+        let end = bytes.windows(4).position(|w| w == b"EMC\n").expect("each ActualText span closes");
+        bytes.drain(end..end + 4);
+    }
     pdfcraft_cos::serialize(&Object::Dict(fonts.clone()), &mut bytes);
     bytes.extend(golden_snapshot(&doc));
     assert_eq!(fnv1a(&bytes), SMALL_ITEM_FINGERPRINT, "small-item output changed");

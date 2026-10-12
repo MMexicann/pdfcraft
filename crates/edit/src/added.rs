@@ -536,6 +536,10 @@ fn draw_laid_shaped(
     let [cr, cg, cb] = t.color.map(|v| v.clamp(0.0, 1.0));
     out.extend(format!("BT {} {} {} rg\n", n(cr), n(cg), n(cb)).bytes());
     for (i, (line, rtl, pieces, w)) in laid.iter().enumerate() {
+        // Shaped glyphs are painted in visual order. Keep the original line's typing order
+        // explicitly, including marks, ligatures, digits and mixed-script punctuation.
+        let logical: String = line.encode_utf16().map(|u| format!("{u:04X}")).collect();
+        out.extend(format!("/Span <</ActualText <FEFF{logical}>>> BDC\n").bytes());
         let spaces = line.matches(' ').count();
         // Justified: the spaces of every line but the last stretch to fill the box.
         let tw = if t.align == Align::Justify && i + 1 < laid.len() && spaces > 0 { ((r[2] - r[0]) - w).max(0.0) / spaces as f64 } else { 0.0 };
@@ -576,6 +580,7 @@ fn draw_laid_shaped(
                 }
             }
         }
+        out.extend_from_slice(b"EMC\n");
     }
     out.extend_from_slice(b"ET\n");
     Ok(())
@@ -935,7 +940,7 @@ fn validate(c: &Content) -> Result<(), EditError> {
             let undrawable = if t.text.chars().any(shaped_arabic) && pdfcraft_fonts::document_arabic_font().is_none() {
                 t.text.split('\n').find_map(|line| {
                     line.chars()
-                        .find(|c| !shaped_arabic(*c) && !(is_thai(*c) && pdfcraft_fonts::thai_has(*c)) && !pdfcraft_fonts::win_ansi_encodable(*c))
+                        .find(|c| !(shaped_arabic(*c) || is_thai(*c) && pdfcraft_fonts::thai_has(*c) || pdfcraft_fonts::win_ansi_encodable(*c)))
                 })
             } else {
                 first_undrawable(t)

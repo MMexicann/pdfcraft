@@ -2753,6 +2753,60 @@ fn group_move_budget_refusals_keep_the_original_page_selectable() {
     }
 }
 
+#[test]
+fn arabic_actual_text_keeps_typing_order_when_opened_for_editing() {
+    for logical in ["مرحبا بالعالم", "سَلَام 123 (PDF)", "English مرحبا ١٢٣", "שלום עולם", "Latin text"] {
+        let hex: String = logical.encode_utf16().map(|u| format!("{u:04X}")).collect();
+        let doc = text_page(&format!("/Span <</ActualText <FEFF{hex}>>> BDC BT /F1 12 Tf 72 700 Td (abcd) Tj (efgh) Tj ET EMC"));
+        for doc in [&doc, &reopen(&doc)] {
+            let lines = text::text_lines(doc, 0).unwrap();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].text, logical, "ActualText is already in typing order");
+            assert_eq!(text::text_blocks(doc, 0).unwrap()[0].editor_text, logical);
+        }
+    }
+}
+
+#[test]
+fn latin_ligature_actual_text_stays_on_its_line() {
+    // Word and Chrome wrap ligatures in ActualText spans mid-word ("ﬁ" drawn, "fi" meant).
+    let hex: String = "fi".encode_utf16().map(|u| format!("{u:04X}")).collect();
+    let doc = text_page(&format!("BT /F1 12 Tf 72 700 Td (de) Tj /Span <</ActualText <FEFF{hex}>>> BDC (X) Tj EMC (ned well) Tj ET"));
+    for doc in [&doc, &reopen(&doc)] {
+        let lines = text::text_lines(doc, 0).unwrap();
+        assert_eq!(lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["defined well"]);
+        assert_eq!(text::text_blocks(doc, 0).unwrap()[0].editor_text, "defined well");
+    }
+}
+
+#[test]
+fn actual_text_and_visual_rtl_glyphs_keep_their_own_reading_order() {
+    let hex: String = "שלום".encode_utf16().map(|u| format!("{u:04X}")).collect();
+    let doc = hebrew_page(&format!("BT /F1 12 Tf 72 700 Td (EDCBA) Tj /Span <</ActualText <FEFF{hex}>>> BDC (FGHD) Tj EMC (EDCBA) Tj ET"));
+    for doc in [&doc, &reopen(&doc)] {
+        let lines = text::text_lines(doc, 0).unwrap();
+        assert_eq!(lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["בדיוק", "שלום", "בדיוק"]);
+    }
+}
+
+#[test]
+fn replacing_arabic_actual_text_removes_the_whole_original_drawing() {
+    let logical = "مرحبا بالعالم";
+    let hex: String = logical.encode_utf16().map(|u| format!("{u:04X}")).collect();
+    let mut doc = text_page(&format!(
+        "/Span <</ActualText <FEFF{hex}>>> BDC BT /F1 12 Tf 72 700 Td (abcd) Tj (efgh) Tj ET EMC \
+         BT /F1 12 Tf 72 600 Td (Keep this line) Tj ET"
+    ));
+    assert_eq!(text::text_blocks(&doc, 0).unwrap()[0].editor_text, logical);
+    text::replace_block(&mut doc, 0, 0, "Replacement").unwrap();
+    let doc = reopen(&doc);
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert_eq!(lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["Replacement", "Keep this line"]);
+    let bytes = page_content_bytes(&doc, 0);
+    let content = String::from_utf8_lossy(&bytes);
+    assert!(!content.contains("ActualText") && !content.contains("(abcd)") && !content.contains("(efgh)"));
+}
+
 fn mixed_region_page() -> Document {
     let mut doc = text_page(
         "BT /F2 1 Tf 18 0 0 18 123 700 Tm (TITLE) Tj ET \
@@ -3092,4 +3146,95 @@ fn marked_paragraph_boundaries_and_cross_stream_transforms_survive_rewrite() {
         assert!(close(a.rect, b.rect) || a.baseline() == b.baseline());
     }
     assert_eq!(after[1].text, "Changed row");
+}
+
+#[test]
+fn logical_indic_with_nuktas_not_reordered_on_standard_font() {
+    // Already logical Hindi text with nuktas (बढ़िया) must not be corrupted by pre-base reordering
+    // when the font does not require visual order.
+    let hex_actual = "<FEFF092C0922093C093F092F093E>";
+    let doc = text_page(&format!("/Span << /ActualText {hex_actual} >> BDC BT /F1 12 Tf 40 500 Td (ab) Tj ET EMC"));
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].text, "\u{092C}\u{0922}\u{093C}\u{093F}\u{092F}\u{093E}");
+    assert!(!lines[0].visual_order);
+}
+
+/// One page in a font named `base_font` whose ToUnicode maps A ब, B ि, C ढ़, D य, E ा, F क, G त.
+/// A legacy visual-order font draws "बढ़िया" as `(ABCDE)` (ब ि ढ़ या) and "किताब" as `(BFGEA)`.
+fn devanagari_page(base_font: &str, content: &str) -> Document {
+    let cmap = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapType 2 def \
+                1 begincodespacerange <00> <FF> endcodespacerange 8 beginbfchar \
+                <20> <0020> <41> <092C> <42> <093F> <43> <0922093C> <44> <092F> <45> <093E> <46> <0915> <47> <0924> \
+                endbfchar endcmap CMapName currentdict /CMap defineresource pop end end";
+    let widths: Vec<&str> = (32..=71)
+        .map(|c| {
+            if c == 32 {
+                "250"
+            } else if c >= 65 {
+                "500"
+            } else {
+                "0"
+            }
+        })
+        .collect();
+    let font = format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /{base_font} /FirstChar 32 /LastChar 71 /Widths [{}] /ToUnicode 6 0 R >>",
+        widths.join(" ")
+    );
+    build(&[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        &stream("", content),
+        &font,
+        &stream("", cmap),
+    ])
+}
+
+/// A legacy visual-order font (Kruti Dev) whose ToUnicode gives the glyphs in drawing order: the
+/// pre-base vowel sign is read back after its consonant, for editing and for reading.
+#[test]
+fn legacy_indic_font_flags_visual_order_and_reorders_pre_base_vowels() {
+    let doc = devanagari_page("KrutiDev010", "BT /F1 12 Tf 40 500 Td (ABCDE) Tj ET");
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].visual_order);
+    assert_eq!(lines[0].text, "\u{092C}\u{0922}\u{093C}\u{093F}\u{092F}\u{093E}");
+    let reading: Vec<String> = text::reading_blocks(&doc, 0).unwrap().into_iter().map(|b| b.text).collect();
+    assert_eq!(reading, ["\u{092C}\u{0922}\u{093C}\u{093F}\u{092F}\u{093E}"]);
+}
+
+/// Typed (logical) text is written back in the font's visual order and reads back as typed.
+#[test]
+fn legacy_indic_font_edits_are_written_in_visual_order() {
+    let mut doc = devanagari_page("ABCDEF+KrutiDev010", "BT /F1 12 Tf 40 500 Td (ABCDE) Tj ET");
+    let kitab = "\u{0915}\u{093F}\u{0924}\u{093E}\u{092C}";
+    assert_eq!(text::replace_line(&mut doc, 0, 0, kitab).unwrap().substituted, None);
+    let content = String::from_utf8_lossy(&page_content_bytes(&doc, 0)).into_owned();
+    assert!(content.contains("(BFGEA)"), "{content}");
+    assert_eq!(text::text_lines(&reopen(&doc), 0).unwrap()[0].text, kitab);
+}
+
+/// `/ActualText` is already in logical order, even in a visual-order font: "बढ़िया" must not
+/// become "बढ़यिा".
+#[test]
+fn logical_actual_text_in_a_legacy_indic_font_is_not_reordered() {
+    let doc = devanagari_page("KrutiDev010", "/Span << /ActualText <FEFF092C0922093C093F092F093E> >> BDC BT /F1 12 Tf 40 500 Td (ABCDE) Tj ET EMC");
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].text, "\u{092C}\u{0922}\u{093C}\u{093F}\u{092F}\u{093E}");
+    let reading: Vec<String> = text::reading_blocks(&doc, 0).unwrap().into_iter().map(|b| b.text).collect();
+    assert_eq!(reading, ["\u{092C}\u{0922}\u{093C}\u{093F}\u{092F}\u{093E}"]);
+}
+
+/// A modern subset font with a logical ToUnicode and no GSUB in the PDF (subsets and bare CFF
+/// often drop it) is not visual order: its text is read as it is.
+#[test]
+fn subset_indic_font_without_legacy_name_keeps_logical_text() {
+    let doc = devanagari_page("ABCDEF+NotoSansDevanagari-Regular", "BT /F1 12 Tf 40 500 Td (ACBDE) Tj ET");
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(!lines[0].visual_order);
+    assert_eq!(lines[0].text, "\u{092C}\u{0922}\u{093C}\u{093F}\u{092F}\u{093E}");
 }

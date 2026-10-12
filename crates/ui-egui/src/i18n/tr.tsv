@@ -716,6 +716,12 @@
 	Flip Vertical	Dikey Çevir
 	Replace Image…	Resmi Değiştir…
 	Save Image As…	Resmi Farklı Kaydet…
+	Copy Image	Resmi Kopyala
+	The image has been copied ({w} × {h} pixels)	Resim kopyalandı ({w} × {h} piksel)
+	Couldn't copy the image: {e}	Resim kopyalanamadı: {e}
+	Copy Image in Original Format	Resmi Özgün Biçimde Kopyala
+	The image has been copied as a {ext} file	Resim {ext} dosyası olarak kopyalandı
+	The page has changed; select the image again	Sayfa değişti; resmi yeniden seçin
 	Check for updates	Güncellemeleri denetle
 	No check has run yet.	Henüz denetim yapılmadı.
 	Checking for a newer version…	Daha yeni bir sürüm denetleniyor…

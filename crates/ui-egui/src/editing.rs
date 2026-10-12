@@ -49,7 +49,7 @@ impl PdfCraftApp {
                 } else if let Some(form_before) = form_before
                     && doc.info.pages.len() == page_count_before
                     && doc.xfa.is_some() == had_xfa
-                    && !doc.xfa.is_some()
+                    && doc.xfa.is_none()
                     && is_form_edit(&edit)
                 {
                     let mut changed_pages = std::collections::BTreeSet::new();

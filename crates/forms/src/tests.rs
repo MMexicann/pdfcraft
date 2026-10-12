@@ -232,6 +232,21 @@ fn opt_export_values_select_button_states() {
     assert!(err.to_string().contains("options: Post, Pick-up"), "{err}");
 }
 
+/// Issue #1323: a text field without a format keeps a whitespace-only value as typed; only an
+/// empty value clears it.
+#[test]
+fn whitespace_only_text_is_kept_in_a_field_without_a_format() {
+    for value in [" ", "\t", "\u{a0}"] {
+        let mut doc = fixture();
+        set_value(&mut doc, "name", &FieldValue::Text(value.into())).unwrap();
+        let doc = reopen(&doc);
+        assert_eq!(field(&fields(&doc), "name").value, [value], "{value:?}");
+    }
+    let mut doc = fixture();
+    set_value(&mut doc, "name", &FieldValue::Text(String::new())).unwrap();
+    assert!(field(&fields(&reopen(&doc)), "name").value.is_empty());
+}
+
 #[test]
 fn text_fields_get_new_appearances() {
     let mut doc = fixture();
@@ -1788,6 +1803,37 @@ fn partial_appearance_preserves_each_widgets_indirect_colours_and_border_extensi
         assert_eq!(mk.int(b"R"), Some(90));
         assert_eq!(mk.int(b"VendorKey"), Some(71));
     }
+}
+
+/// A whole look sets the colours of an indirect /MK and keeps its mark, rotation and unknown
+/// entries (#1322), as it already did for a direct one.
+#[test]
+fn a_whole_look_keeps_the_rest_of_an_indirect_mk() {
+    let mut doc = fixture();
+    let widget = field(&fields(&doc), "agree").widgets[0].obj;
+    let mut mk = pdfcraft_cos::Dict::new();
+    mk.set(b"CA".to_vec(), pdfcraft_cos::PdfString::text("8"));
+    mk.set(b"R".to_vec(), Object::Int(90));
+    mk.set(b"VendorKey".to_vec(), Object::Int(71));
+    let mk_ref = doc.add(Object::Dict(mk));
+    doc.update_dict(widget, |d| d.set(b"MK".to_vec(), Object::Ref(mk_ref))).unwrap();
+    let new = Look {
+        border: Some([1.0, 0.0, 0.0]),
+        fill: Some([1.0, 1.0, 0.8]),
+        width: 2.0,
+        style: BorderStyle::Solid,
+        text: [0.0; 3],
+        font: FieldFont::Helvetica,
+    };
+    set_props(&mut doc, "agree", &FieldProps { look: Some(new), ..FieldProps::default() }).unwrap();
+    let doc = reopen(&doc);
+    let f = field(&fields(&doc), "agree").clone();
+    assert_eq!((check_style(&doc, &f), f.widgets[0].rotation), (CheckStyle::Cross, 90));
+    let mk = doc.get(widget).as_dict().unwrap().get(b"MK").map(|v| doc.resolve(v)).unwrap();
+    let mk = mk.as_dict().unwrap();
+    assert_eq!(mk.int(b"VendorKey"), Some(71));
+    assert_eq!(look(&doc, &f).border, Some([1.0, 0.0, 0.0]));
+    assert_eq!(look(&doc, &f).fill, Some([1.0, 1.0, 0.8]));
 }
 
 #[test]

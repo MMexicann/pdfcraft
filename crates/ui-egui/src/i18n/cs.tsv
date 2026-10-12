@@ -835,6 +835,12 @@ key	Space	Mezerník
 	Flip Vertical	Převrátit svisle
 	Replace Image…	Nahradit obrázek…
 	Save Image As…	Uložit obrázek jako…
+	Copy Image	Kopírovat obrázek
+	The image has been copied ({w} × {h} pixels)	Obrázek byl zkopírován ({w} × {h} pixelů)
+	Couldn't copy the image: {e}	Obrázek nelze zkopírovat: {e}
+	Copy Image in Original Format	Kopírovat obrázek v původním formátu
+	The image has been copied as a {ext} file	Obrázek byl zkopírován jako soubor {ext}
+	The page has changed; select the image again	Stránka se změnila; vyberte obrázek znovu
 	Check for updates	Zkontrolovat aktualizace
 	No check has run yet.	Kontrola zatím neproběhla.
 	Checking for a newer version…	Hledání novější verze…

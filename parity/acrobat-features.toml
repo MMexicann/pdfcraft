@@ -1554,6 +1554,18 @@ evidence = ["crates/ui-egui/tests/viewer.rs::marquee_zoom_and_snapshot"]
 notes = "copies the area at the current zoom to the clipboard as an image"
 
 [[feature]]
+id = "view.copy-image"
+title = "Select an image on the page and copy it"
+area = "B"
+tier = "P2"
+milestone = "M3"
+status = "partial"
+commands = []
+tools = []
+evidence = ["crates/ui-egui/tests/viewer.rs::a_clicked_picture_is_selected_and_copied_in_its_original_format", "crates/ui-egui/tests/viewer.rs::right_click_on_a_picture_copies_it_at_full_size", "crates/ui-egui/tests/viewer.rs::a_picture_inside_form_artwork_under_text_is_selected_and_copied", "crates/engine/src/tests.rs::copy_image_finds_a_picture_inside_form_artwork_under_text"]
+notes = "Select tool: a click selects a raster image (also inside Form artwork or under text) and ⌘C copies it as a file in its original format (JPEG as stored, else PNG); right-click ▸ Copy Image copies its pixels at full resolution. Missing: inline images (BI/ID/EI), JPEG 2000/JBIG2/CCITT images, multi-format clipboard (file and bitmap at once), the web build"
+
+[[feature]]
 id = "view.rulers"
 title = "Rulers"
 area = "B"
@@ -1974,8 +1986,8 @@ milestone = "M7"
 status = "shipped"
 commands = ["edit.text"]
 tools = ["page_add_text", "content_update"]
-evidence = ["crates/ui-egui/tests/content.rs::typing_moving_styling_and_deleting_added_content", "crates/ui-egui/tests/content.rs::clicking_elsewhere_keeps_the_text_and_starts_a_new_box", "crates/automation/tests/automation.rs::adding_content_through_tools", "crates/edit/src/tests.rs::added_text_and_images_are_page_content_that_stays_editable", "crates/engine/src/tests.rs::added_text_and_images_render_and_stay_editable", "crates/edit/src/tests.rs::added_arabic_text_is_shaped_in_display_order_and_stays_searchable", "crates/automation/tests/automation.rs::thai_text_through_tools_saves_reopens_extracts_and_renders", "crates/ui-egui/tests/content.rs::typing_thai_text_keeps_marks_and_commits_to_page"]
-notes = "page content, editable later (retype, move, restyle); standard fonts, Windows-1252 text. Arabic text is shaped with the craft-fonts Arab face (Type 3 outlines with ToUnicode) and laid out in bidirectional display order; it is drawn regular whatever the bold/italic setting, Hebrew and other right-to-left scripts are not covered, and typing in the box is still left to right (misc.rtl-ui). Thai Add Text uses the craft-fonts Thai face, with shaped clusters and ToUnicode; Thai is regular style, wrapping preserves clusters but is not dictionary-based, and forms/Fill and Sign are not covered by this change. Each click on the page keeps the box being typed and starts a new one; Done and Discard beside the box"
+evidence = ["crates/ui-egui/tests/content.rs::typing_moving_styling_and_deleting_added_content", "crates/ui-egui/tests/content.rs::clicking_elsewhere_keeps_the_text_and_starts_a_new_box", "crates/automation/tests/automation.rs::adding_content_through_tools", "crates/edit/src/tests.rs::added_text_and_images_are_page_content_that_stays_editable", "crates/engine/src/tests.rs::added_text_and_images_render_and_stay_editable", "crates/edit/src/tests.rs::added_arabic_text_is_shaped_in_display_order_and_stays_searchable", "crates/automation/tests/automation.rs::thai_text_through_tools_saves_reopens_extracts_and_renders", "crates/ui-egui/tests/content.rs::typing_thai_text_keeps_marks_and_commits_to_page", "crates/automation/tests/automation.rs::added_arabic_text_keeps_copy_search_and_editor_order_after_retyping_and_reopen"]
+notes = "page content, editable later (retype, move, restyle); standard fonts, Windows-1252 text. Arabic text is shaped with the craft-fonts Arab face (Type 3 outlines with ToUnicode) and laid out in bidirectional display order; per-line ActualText keeps copy, search and editor text in typing order through retyping and save/reopen; it is drawn regular whatever the bold/italic setting, Hebrew and other right-to-left scripts are not covered, and typing in the box is still left to right (misc.rtl-ui). Thai Add Text uses the craft-fonts Thai face, with shaped clusters and ToUnicode; Thai is regular style, wrapping preserves clusters but is not dictionary-based, and forms/Fill and Sign are not covered by this change. Each click on the page keeps the box being typed and starts a new one; Done and Discard beside the box"
 
 [[feature]]
 id = "edit.find-replace"
@@ -1998,8 +2010,8 @@ milestone = "M7"
 status = "partial"
 commands = []
 tools = ["text_lines", "text_paragraphs", "text_edit"]
-evidence = ["crates/edit/src/tests.rs::hebrew_lines_read_in_typing_order", "crates/edit/src/tests.rs::hebrew_edits_are_drawn_right_to_left_and_keep_their_right_edge", "crates/edit/src/tests.rs::hebrew_letters_the_page_font_lacks_use_the_hebrew_face", "crates/edit/src/bidi.rs::hebrew_sentences_numbers_latin_and_brackets_round_trip"]
-notes = "Hebrew: lines and paragraphs read in typing order and are written back in drawing order, right-aligned by default; letters the page's font lacks use the craft-fonts Noto Sans Hebrew face as Type 3 glyphs. Japanese uses its Type 3 fallback. Missing: Hebrew points (niqqud) in replacement text, writing Arabic (shaping), right-to-left typing in the edit box (misc.rtl-ui), lines a producer draws word by word from the right, vertical CJK. Also (#1116): bounded single-face existing-text engine coverage now exists (Arabic marks/ligatures/mixed bidi and explicit full-face Chinese subset completion), with private keyboard/save/reopen checks. General mixed-font/style contextual runs, bidi caret/selection, legacy programs and release font availability remain incomplete, so broader feature remains planned"
+evidence = ["crates/edit/src/tests.rs::hebrew_lines_read_in_typing_order", "crates/edit/src/tests.rs::hebrew_edits_are_drawn_right_to_left_and_keep_their_right_edge", "crates/edit/src/tests.rs::hebrew_letters_the_page_font_lacks_use_the_hebrew_face", "crates/edit/src/bidi.rs::hebrew_sentences_numbers_latin_and_brackets_round_trip", "crates/edit/src/tests.rs::arabic_actual_text_keeps_typing_order_when_opened_for_editing", "crates/automation/tests/automation.rs::arabic_actual_text_stays_logical_through_editor_tools_and_save_reopen", "crates/automation/tests/automation.rs::added_arabic_text_keeps_copy_search_and_editor_order_after_retyping_and_reopen"]
+notes = "Added Arabic copy/search keeps typing order through per-line ActualText. Arabic/Hebrew ActualText is preserved in typing order rather than reordered twice; font-independent tests cover marks, numbers, Latin, reopening and complete replacement. This does not add Arabic fallback fonts or bidi caret/selection. Hebrew: lines and paragraphs read in typing order and are written back in drawing order, right-aligned by default; letters the page's font lacks use the craft-fonts Noto Sans Hebrew face as Type 3 glyphs. Japanese uses its Type 3 fallback. Missing: Hebrew points (niqqud) in replacement text, writing Arabic (shaping), right-to-left typing in the edit box (misc.rtl-ui), lines a producer draws word by word from the right, vertical CJK. Also (#1116): bounded single-face existing-text engine coverage now exists (Arabic marks/ligatures/mixed bidi and explicit full-face Chinese subset completion), with private keyboard/save/reopen checks. General mixed-font/style contextual runs, bidi caret/selection, legacy programs and release font availability remain incomplete, so broader feature remains planned"
 
 [[feature]]
 id = "edit.rotated-text-editing"
@@ -6501,11 +6513,11 @@ title = "Editable text and images output"
 area = "I"
 tier = "P1"
 milestone = "M10"
-status = "planned"
-commands = []
-tools = []
-evidence = []
-notes = ""
+status = "partial"
+commands = ["edit.edit_text"]
+tools = ["text_edit"]
+evidence = ["crates/engine/tests/ocr_edit.rs::editing_an_ocr_word_covers_the_scan_and_shows_the_new_text", "crates/engine/tests/ocr_edit.rs::an_explicit_colour_is_kept_for_the_new_text", "crates/engine/tests/ocr_edit.rs::ocr_words_group_into_phrases_that_edit_in_place", "crates/engine/tests/ocr_edit.rs::a_longer_ocr_phrase_grows_rightwards", "crates/engine/tests/ocr_edit.rs::a_rewritten_ocr_phrase_keeps_its_word_widths", "crates/ui-egui/tests/ocr.rs::an_ocr_word_opens_for_editing_and_stays_open"]
+notes = "On demand, per edit: in Edit text & images, recognised text (the invisible OCR layer over a scan) is grouped into phrases (words across a word space; a wider gap such as a table cell, and each scanned line, stay separate) and opens for editing on a click. Applying draws the new text visibly in the scan's sampled ink colour (or the chosen one) and first covers the old words with the paper colour sampled around them, so the scanned word no longer shows; the phrase keeps each word's position and width and grows rightwards instead of wrapping. Still missing: Acrobat's Recognize Text output that converts a whole page to editable text at once, matching the scanned typeface (the layer's Helvetica is used), and covering on a textured or patterned background (one flat colour is used)."
 
 [[feature]]
 id = "ocr.ocr-downsample"
@@ -8813,11 +8825,11 @@ title = "Automatically tag a document"
 area = "M"
 tier = "P1"
 milestone = "M12"
-status = "planned"
+status = "partial"
 commands = []
-tools = []
-evidence = []
-notes = ""
+tools = ["accessibility_autotag_preview"]
+evidence = ["crates/automation/tests/automation.rs::autotag_preview_proposes_text_without_changing_the_pdf"]
+notes = "Preview proposes paragraph or heading roles for bounded visible text blocks on one page and flags them for review. It does not write tags, mark content, build a parent tree or classify images, tables, lists and annotations."
 
 [[feature]]
 id = "a11y.autotag-fields"

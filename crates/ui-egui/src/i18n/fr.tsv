@@ -734,6 +734,12 @@
 	Flip Vertical	Retourner verticalement
 	Replace Image…	Remplacer l'image…
 	Save Image As…	Enregistrer l'image sous…
+	Copy Image	Copier l'image
+	The image has been copied ({w} × {h} pixels)	L'image a été copiée ({w} × {h} pixels)
+	Couldn't copy the image: {e}	Impossible de copier l'image : {e}
+	Copy Image in Original Format	Copier l'image au format d'origine
+	The image has been copied as a {ext} file	L'image a été copiée en tant que fichier {ext}
+	The page has changed; select the image again	La page a changé ; sélectionnez de nouveau l'image
 	Check for updates	Rechercher des mises à jour
 	No check has run yet.	Aucune vérification n'a encore été faite.
 	Checking for a newer version…	Recherche d'une version plus récente…

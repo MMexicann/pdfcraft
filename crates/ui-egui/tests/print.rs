@@ -16,6 +16,68 @@ fn harness() -> Harness<'static, PdfCraftApp> {
 }
 
 #[test]
+fn current_print_page_saves_the_viewed_page_when_labels_restart() {
+    // Five distinct painted pages, labelled i, ii, iii, 1, 2.
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /r >> 3 << /S /D /St 1 >>] >> >>".to_owned(),
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R 11 0 R] /Count 5 /MediaBox [0 0 200 300] >>".to_owned(),
+    ];
+    for (i, color) in ["1 0 0", "0 1 0", "0 0 1", "1 1 0", "1 0 1"].iter().enumerate() {
+        objects.push(format!("<< /Type /Page /Parent 2 0 R /Resources << >> /Contents {} 0 R >>", 4 + i * 2));
+        let content = format!("{color} rg 0 0 200 300 re f");
+        objects.push(format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()));
+    }
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(format!("trailer << /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).as_bytes());
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("labelled.pdf", None, bytes).unwrap();
+        app
+    });
+    h.run_steps(4);
+    let id = h.state().views[0].id;
+    let labels: Vec<_> = h.state().session.get(id).unwrap().info.pages.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(labels, ["i", "ii", "iii", "1", "2"]);
+    for (current, expected) in [[255, 0, 0], [0, 255, 0]].into_iter().enumerate() {
+        h.state_mut().set_option("page", &(current + 1).to_string()).unwrap();
+        h.run_steps(3);
+        assert!(h.state_mut().execute("print.dialog"));
+        h.run_steps(3);
+        h.get_by_label("Current page").click();
+        h.run_steps(3);
+        assert_eq!(h.state().print_draft.current_page, current);
+        h.get_by_label("Sheet 1 of 1");
+        let out = std::env::temp_dir().join(format!("pdfcraft-print-current-{}-{current}.pdf", std::process::id()));
+        h.state_mut().save_override = Some(out.to_string_lossy().into_owned());
+        h.state_mut().print_draft.printer = None;
+        h.run_steps(1);
+        h.get_by_label("Save as PDF").click();
+        h.run_steps(3);
+        assert_eq!(h.state().dialog, None);
+        let saved = std::sync::Arc::new(std::fs::read(&out).unwrap());
+        std::fs::remove_file(out).unwrap();
+        let doc = pdfcraft_cos::Document::open(saved.clone()).unwrap();
+        assert_eq!(pdfcraft_model::pages(&doc).len(), 1);
+        let mut renderer = pdfcraft_render::PageRenderer::new(saved, Default::default());
+        let shot = renderer.render(pdfcraft_render::RenderRequest { page: 0, scale: 1.0, ..Default::default() });
+        assert!(shot.error.is_none(), "{:?}", shot.error);
+        let center = ((shot.height / 2 * shot.width + shot.width / 2) * 4) as usize;
+        assert_eq!(&shot.rgba[center..center + 3], &expected, "saved the wrong physical page for {current}");
+    }
+}
+
+#[test]
 fn print_dialog_lays_out_sheets_and_saves_a_pdf() {
     let mut h = harness();
     assert!(h.state_mut().execute("print.dialog"));

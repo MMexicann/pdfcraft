@@ -114,6 +114,20 @@ fn faux_redaction_is_found() {
 }
 
 #[test]
+fn identity_matrix_between_rectangle_and_fill_still_covers_text() {
+    // A no-op `cm` inside the path must not drop the pending rectangle (#1333).
+    for cover in [&b"0 g\n100 688 220 32 re 1 0 0 1 0 0 cm f\n"[..], b"0 g\n1 0 0 1 0 0 cm 100 688 220 32 re f\n"] {
+        let mut content = b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n".to_vec();
+        content.extend_from_slice(cover);
+        let findings = audit_redactions(&open(one_page(&content, ""))).expect("audit must run");
+        assert_eq!(findings.len(), 1, "{:?}: {findings:?}", String::from_utf8_lossy(cover));
+        assert_eq!(findings[0].kind, FindingKind::CoveredText);
+        assert_eq!(findings[0].rect, [100.0, 688.0, 320.0, 720.0]);
+        assert_eq!(findings[0].covered_text, "SECRET DATA 123");
+    }
+}
+
+#[test]
 fn clean_document_has_no_findings() {
     let content = b"BT /F1 24 Tf 100 700 Td (nothing hidden here) Tj ET\n";
     let findings = audit_redactions(&open(one_page(content, ""))).expect("audit must run");

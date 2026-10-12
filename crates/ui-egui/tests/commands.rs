@@ -234,6 +234,22 @@ fn the_palette_lists_commands_with_shortcuts_and_runs_them() {
 }
 
 #[test]
+fn palette_arrow_keys_select_results_and_enter_runs_the_selection() {
+    let mut h = harness();
+    h.state_mut().set_option("palette", "rotate pages").unwrap();
+    h.run_steps(2);
+    h.get_by_label("Rotate pages clockwise");
+    h.get_by_label("Rotate pages counterclockwise");
+    h.key_press(Key::ArrowDown);
+    h.run_steps(2);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    let app = h.state();
+    assert!(!app.palette_open);
+    assert_eq!(app.session.get(app.views[0].id).unwrap().info.pages[0].rotation, 270);
+}
+
+#[test]
 fn the_pages_menu_comes_from_the_registry() {
     let mut h = harness();
     h.get_by_label("Menu").click();

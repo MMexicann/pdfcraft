@@ -36,6 +36,10 @@ fn fixture(n: usize) -> Vec<u8> {
 }
 
 fn remote_link_pdf(file: &str, destination: Option<&str>) -> Vec<u8> {
+    // canonicalize() uses a Windows device prefix; a PDF file specification uses the ordinary drive path.
+    #[cfg(windows)]
+    let file = file.strip_prefix(r"\\?\").filter(|path| path.as_bytes().get(1) == Some(&b':')).unwrap_or(file);
+    let file = file.replace('\\', "\\\\").replace('(', "\\(").replace(')', "\\)");
     let destination = destination.map_or_else(String::new, |d| format!("/D {d}"));
     let objects: Vec<Vec<u8>> = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
@@ -109,6 +113,36 @@ fn workdir_call_sites_do_not_delete_each_other() {
 
 fn auto(dir: &Path) -> Automation {
     Automation::new().with_root(dir).unwrap().with_clock(|| 1_700_000_000)
+}
+
+#[test]
+fn autotag_preview_proposes_text_without_changing_the_pdf() {
+    let dir = workdir("autotag-preview");
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({ "path": "a.pdf" }))["doc"].as_u64().unwrap();
+    let before = std::fs::read(dir.join("a.pdf")).unwrap();
+
+    let preview = ok(&mut a, "accessibility_autotag_preview", json!({ "doc": doc, "page": 1 }));
+    assert_eq!(preview["page"], 1);
+    assert_eq!(preview["candidates"][0]["type"], "P");
+    assert_eq!(preview["candidates"][0]["text"], "Page 1");
+    assert_eq!(preview["candidates"][0]["needs_review"], true);
+    assert_eq!(preview["unclassified_images"], 0);
+    assert_eq!(preview["unclassified_text_blocks"], 0);
+    assert_eq!(preview["existing_structure"], false);
+    assert_eq!(std::fs::read(dir.join("a.pdf")).unwrap(), before);
+    assert!(matches!(
+        a.call("accessibility_autotag_preview", &json!({ "doc": doc, "page": 4 })),
+        Err(ToolError::InvalidArgs(_) | ToolError::Failed(_))
+    ));
+
+    let blank = ok(&mut a, "doc_create", json!({ "from": "blank", "width": 300, "height": 400 }))["doc"].as_u64().unwrap();
+    ok(&mut a, "page_add_text", json!({ "doc": blank, "page": 1, "text": "Annual report", "at": [20, 25], "size": 24 }));
+    ok(&mut a, "page_add_text", json!({ "doc": blank, "page": 1, "text": "First paragraph", "at": [20, 100], "size": 12 }));
+    ok(&mut a, "page_add_text", json!({ "doc": blank, "page": 1, "text": "Second paragraph", "at": [20, 140], "size": 12 }));
+    let preview = ok(&mut a, "accessibility_autotag_preview", json!({ "doc": blank, "page": 1 }));
+    assert!(preview["candidates"].as_array().unwrap().iter().any(|c| c["text"] == "Annual report" && c["type"] == "H1"));
+    assert!(preview["candidates"].as_array().unwrap().iter().any(|c| c["text"] == "First paragraph" && c["type"] == "P"));
 }
 
 /// A one-page PDF whose form holds one text field named `name`.
@@ -233,6 +267,60 @@ fn explicit_font_and_disjoint_ranges_save_reopen_through_tools() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn added_arabic_text_keeps_copy_search_and_editor_order_after_retyping_and_reopen() {
+    if pdfcraft_fonts::document_arabic_font().is_none() {
+        eprintln!("set CRAFT_FONTS_DIR to exercise added Arabic text");
+        return;
+    }
+    let dir = workdir("arabic-copy-order");
+    let mut a = auto(&dir);
+    let id = ok(&mut a, "doc_create", json!({"from":"blank","width":600,"height":400}))["doc"].as_u64().unwrap();
+    let original = "سَلَام 123 (PDF) - اختبار الكتابة العربية";
+    ok(&mut a, "page_add_text", json!({"doc":id,"page":1,"text":original,"at":[40,50],"width":500,"size":16,"align":"right"}));
+    assert_eq!(page_text(&mut a, id), [original]);
+    assert_eq!(ok(&mut a, "text_lines", json!({"doc":id,"page":1}))["lines"][0]["text"], original);
+    let found = ok(&mut a, "text_find", json!({"doc":id,"query":original}));
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1);
+    let retyped = "مُرَاجَعَة PDF رقم ١٢٣";
+    ok(&mut a, "content_update", json!({"doc":id,"page":1,"index":1,"text":retyped}));
+    ok(&mut a, "doc_save", json!({"doc":id,"path":"retyped.pdf"}));
+    let re = ok(&mut a, "doc_open", json!({"path":"retyped.pdf"}))["doc"].as_u64().unwrap();
+    assert_eq!(page_text(&mut a, re), [retyped]);
+    assert_eq!(ok(&mut a, "text_lines", json!({"doc":re,"page":1}))["lines"][0]["text"], retyped);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn arabic_actual_text_stays_logical_through_editor_tools_and_save_reopen() {
+    use pdfcraft_cos::{Dict, Document, ObjRef, Object, SaveOptions, Stream, write_full};
+    use std::sync::Arc;
+
+    let dir = workdir("arabic-actual-text");
+    let logical = "سَلَام 123 (PDF)";
+    let hex: String = logical.encode_utf16().map(|u| format!("{u:04X}")).collect();
+    let content = format!("/Span <</ActualText <FEFF{hex}>>> BDC BT /F1 24 Tf 20 150 Td (abcd) Tj (efgh) Tj ET EMC");
+    let mut doc = Document::open(Arc::new(fixture(1))).unwrap();
+    doc.set(ObjRef::new(5, 0), Object::Stream(Stream::flate(Dict::new(), content.as_bytes())));
+    std::fs::write(dir.join("arabic.pdf"), write_full(&doc, &SaveOptions::default()).unwrap()).unwrap();
+
+    let mut a = auto(&dir);
+    let id = ok(&mut a, "doc_open", json!({"path":"arabic.pdf"}))["doc"].as_u64().unwrap();
+    let lines = ok(&mut a, "text_lines", json!({"doc":id,"page":1}));
+    assert_eq!(lines["lines"][0]["text"], logical);
+    let render = a.call("page_render", &json!({"doc":id,"page":1,"dpi":72})).unwrap();
+    ok(&mut a, "doc_save", json!({"doc":id,"path":"saved.pdf"}));
+    let re = ok(&mut a, "doc_open", json!({"path":"saved.pdf"}))["doc"].as_u64().unwrap();
+    assert_eq!(ok(&mut a, "text_lines", json!({"doc":re,"page":1})), lines);
+    assert_eq!(a.call("page_render", &json!({"doc":re,"page":1,"dpi":72})).unwrap(), render);
+    ok(&mut a, "text_edit", json!({"doc":re,"page":1,"paragraph":1,"text":"Replacement"}));
+    ok(&mut a, "doc_save", json!({"doc":re,"path":"edited.pdf"}));
+    let edited = ok(&mut a, "doc_open", json!({"path":"edited.pdf"}))["doc"].as_u64().unwrap();
+    assert_eq!(ok(&mut a, "text_lines", json!({"doc":edited,"page":1}))["lines"][0]["text"], "Replacement");
+    assert_eq!(page_text(&mut a, edited), ["Replacement"]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Each of these writes to its required `path` and replaces an existing file there, so the MCP
 /// annotations must not tell clients the call is read-only or harmless (#130).
 #[test]
@@ -340,6 +428,30 @@ fn edit_undo_redo_and_save_round_trip() {
     let after = std::fs::read(dir.join("out/edited.pdf")).unwrap();
     assert!(after.len() as u64 > before);
     assert_eq!(after.windows(5).filter(|w| w == b"%%EOF").count(), 2);
+}
+
+/// Issue #1329: an in-place save says it was incremental only when it kept the file it was
+/// saving over: protecting or sanitizing rewrites the file, and the result says so.
+#[test]
+fn an_in_place_save_reports_a_required_rewrite_as_not_incremental() {
+    let dir = workdir("save-incremental-flag");
+    let original = std::fs::read(dir.join("a.pdf")).unwrap();
+    let cases = [
+        ("page_rotate", json!({ "pages": [1], "degrees": 90 }), true),
+        ("doc_protect", json!({ "open_password": "openme" }), false),
+        ("doc_remove_hidden", json!({}), false),
+    ];
+    for (tool, args, incremental) in cases {
+        std::fs::write(dir.join("a.pdf"), &original).unwrap();
+        let mut a = auto(&dir);
+        let doc = ok(&mut a, "doc_open", json!({ "path": "a.pdf" }))["doc"].as_u64().unwrap();
+        let mut args = args;
+        args["doc"] = json!(doc);
+        ok(&mut a, tool, args);
+        let saved = ok(&mut a, "doc_save", json!({ "doc": doc }));
+        let kept = std::fs::read(dir.join("a.pdf")).unwrap().starts_with(&original);
+        assert_eq!((saved["incremental"].as_bool(), kept), (Some(incremental), incremental), "{tool}");
+    }
 }
 
 /// organize.field-name-conflicts: combining files whose forms share a field name keeps the
@@ -2966,6 +3078,53 @@ fn adding_content_through_tools() {
     assert!(matches!(a.call("content_delete", &json!({ "doc": doc, "page": 1, "index": 5 })), Err(ToolError::Failed(_))));
 }
 
+/// Text styling on an added image is refused (#1331), as image transforms are on text, and the
+/// refusal leaves the content, the dirty flag and the undo and redo steps as they were.
+#[test]
+fn text_styling_on_an_image_is_refused_without_an_edit() {
+    let dir = workdir("content-style");
+    let mut png = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png, 1, 1);
+        enc.set_color(png::ColorType::Rgb);
+        enc.write_header().unwrap().write_image_data(&[80, 160, 200]).unwrap();
+    }
+    std::fs::write(dir.join("logo.png"), png).unwrap();
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({ "path": "a.pdf" }))["doc"].as_u64().unwrap();
+    ok(&mut a, "page_add_text", json!({ "doc": doc, "page": 1, "text": "sample", "at": [20, 20] }));
+    ok(&mut a, "page_add_image", json!({ "doc": doc, "page": 1, "path": "logo.png", "rect": [10, 100, 40, 130] }));
+    ok(&mut a, "content_update", json!({ "doc": doc, "page": 1, "index": 2, "rotate": 90 }));
+    ok(&mut a, "edit_undo", json!({ "doc": doc }));
+    ok(&mut a, "doc_save", json!({ "doc": doc, "path": "saved.pdf" }));
+    let state = |a: &Automation| {
+        let d = a.session().docs().iter().find(|d| d.id.0 == doc).unwrap();
+        (format!("{:?}", d.added), d.dirty, d.edit_generation(), d.can_undo().map(str::to_owned), d.can_redo().map(str::to_owned))
+    };
+    let before = state(&a);
+    assert!(!before.1 && before.4.is_some(), "a clean document with a step to redo: {before:?}");
+    for (key, value) in [
+        ("font", json!("times")),
+        ("size", json!(24)),
+        ("bold", json!(true)),
+        ("italic", json!(true)),
+        ("color", json!("red")),
+        ("align", json!("center")),
+    ] {
+        for rect in [None, Some(json!([20, 100, 50, 130]))] {
+            let mut args = json!({ "doc": doc, "page": 1, "index": 2 });
+            args[key] = value.clone();
+            if let Some(r) = rect {
+                args["rect"] = r;
+            }
+            assert!(matches!(a.call("content_update", &args), Err(ToolError::InvalidArgs(_))), "{args}");
+            assert_eq!(state(&a), before, "{args}");
+        }
+    }
+    ok(&mut a, "content_update", json!({ "doc": doc, "page": 1, "index": 1, "font": "times", "size": 24, "align": "center" }));
+    assert!(state(&a).1, "text still takes its styling");
+}
+
 #[test]
 fn form_formats_and_calculations_through_tools() {
     let dir = workdir("formcalc");
@@ -4139,6 +4298,29 @@ fn pdfa_through_tools() {
     assert_eq!(r["declared"]["pdfa"], "PDF/A-3b", "{r}");
     assert!(r["issues"].as_array().unwrap().iter().all(|i| i["fixable"] == false), "{r}");
     assert!(a.call("pdfa_verify", &json!({ "doc": doc, "level": "9z" })).is_err());
+}
+
+#[test]
+fn print_readiness_through_tools() {
+    let dir = workdir("print-readiness");
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_create", json!({ "from": "text", "text": "Proof me" }))["doc"].as_u64().unwrap();
+    let before = ok(&mut a, "doc_info", json!({ "doc": doc }));
+    let r = ok(&mut a, "print_readiness", json!({ "doc": doc }));
+    assert!(r["text"].as_str().unwrap().contains("verification only"), "{r}");
+    assert_eq!(r["pages"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["pages"][0]["trim_set"], false, "{r}");
+    assert_eq!(r["resolution_unknown"], 0, "{r}");
+    let findings = r["findings"].as_array().unwrap();
+    // A page without a TrimBox is one informational note for the document, not a bleed warning.
+    assert!(!findings.iter().any(|f| f["id"] == "page-bleed"), "{r}");
+    let trim: Vec<_> = findings.iter().filter(|f| f["id"] == "page-trim").collect();
+    assert_eq!(trim.len(), 1, "{r}");
+    assert_eq!(trim[0]["severity"], "info");
+    assert!(trim[0]["page"].is_null(), "{r}");
+    assert_eq!(ok(&mut a, "doc_info", json!({ "doc": doc })), before, "verification doesn't change the document");
+    assert!(a.call("print_readiness", &json!({ "doc": 999 })).is_err());
+    assert!(pdfcraft_automation::tools().iter().any(|t| t.name == "print_readiness" && t.read_only));
 }
 
 #[test]

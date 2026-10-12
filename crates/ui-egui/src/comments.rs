@@ -1431,6 +1431,10 @@ pub enum CanvasAction {
     OpenComments,
     /// Comment Properties for (page, index).
     Properties(usize, usize),
+    /// Copy Image: image (page, index in `page_images`) to the clipboard.
+    CopyImage(usize, usize),
+    /// Copy Image in Original Format: the same image as a file (JPEG as stored, else PNG).
+    CopyImageFile(usize, usize),
 }
 
 /// How many custom colours the "Recent colours" row keeps.

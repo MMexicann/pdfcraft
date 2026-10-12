@@ -129,15 +129,15 @@ impl PrintDraft {
             return Err("Cut and stack needs Two-sided: Off. Print single-sided sheets.".into());
         }
         let range = match self.which {
-            Which::All | Which::Selected => None,
-            Which::Current => Some(self.current_page.saturating_add(1).to_string()),
+            Which::All | Which::Selected | Which::Current => None,
             Which::Range => Some(self.range.clone()),
         };
-        let pages = if self.which == Which::Selected {
-            // Positions, not a typed range: a range would read numbers as page labels first.
-            print::select_listed(count, &self.selected, self.subset, self.reverse)
-        } else {
-            print::select_pages(count, range.as_deref(), labels, self.subset, self.reverse)
+        // Selected and Current are positions, not a typed range: a range would read numbers as
+        // page labels first.
+        let pages = match self.which {
+            Which::Selected => print::select_listed(count, &self.selected, self.subset, self.reverse),
+            Which::Current => print::select_listed(count, &[self.current_page], self.subset, self.reverse),
+            Which::All | Which::Range => print::select_pages(count, range.as_deref(), labels, self.subset, self.reverse),
         }
         // What the person got wrong about what to print is said in their language: the engine hands
         // the wording over whole and the page numbers apart from it.
@@ -1029,12 +1029,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn current_page_preview_uses_positions_and_selection_guards() {
+        for labels in [["i", "ii", "iii", "1", "2"], ["1", "1", "1", "1", "1"], ["1", "2", "3", "4", "5"]] {
+            let labels: Vec<String> = labels.into_iter().map(str::to_owned).collect();
+            for current_page in 0..5 {
+                let draft = PrintDraft { which: Which::Current, current_page, ..Default::default() };
+                let rasters = preview_rasters(&draft, &[(200.0, 300.0); 5], &labels, 1.0, 8192.0);
+                assert_eq!(rasters.iter().map(|(page, _)| *page).collect::<Vec<_>>(), vec![current_page]);
+            }
+        }
+        let labels: Vec<String> = ["i", "ii", "iii", "1", "2"].into_iter().map(str::to_owned).collect();
+        let mut draft = PrintDraft { which: Which::Selected, selected: vec![0, 3], ..Default::default() };
+        assert_eq!(draft.settings(5, &labels).unwrap().pages, vec![0, 3]);
+        draft.which = Which::All;
+        assert_eq!(draft.settings(5, &labels).unwrap().pages, vec![0, 1, 2, 3, 4]);
+        draft.which = Which::Current;
+        draft.reverse = true;
+        draft.subset = Subset::Odd;
+        assert_eq!(draft.settings(5, &labels).unwrap().pages, vec![0]);
+        draft.subset = Subset::Even;
+        assert!(draft.settings(5, &labels).is_err());
+        draft.subset = Subset::All;
+        for (count, current) in [(0, 0), (5, 5), (5, usize::MAX)] {
+            draft.current_page = current;
+            assert!(draft.settings(count, &labels).is_err());
+        }
+    }
+
+    #[test]
     fn composed_sheets_keep_exact_scaling_and_the_dialogs_duplex_choice() {
         let draft = PrintDraft { duplex: spool::Duplex::LongEdge, ..PrintDraft::default() };
         let job = draft.job("report.pdf");
         assert_eq!(job.scaling, spool::Scaling::Exact);
         assert_eq!(job.duplex, Some(spool::Duplex::LongEdge));
         assert_eq!(PrintDraft::default().job("report.pdf").duplex, Some(spool::Duplex::Off));
+    }
+
+    /// Issue #1308: Current page is the page on screen, even when a later page is labelled with
+    /// its number. A typed range still reads labels first.
+    #[test]
+    fn current_page_is_the_viewed_page_not_a_label() {
+        let labels: Vec<String> = ["i", "ii", "iii", "1", "2"].map(String::from).to_vec();
+        for (current, want) in [(0, vec![0]), (1, vec![1]), (3, vec![3])] {
+            let d = PrintDraft { which: Which::Current, current_page: current, ..PrintDraft::default() };
+            assert_eq!(d.settings(5, &labels).map(|s| s.pages), Ok(want), "viewing page {}", current + 1);
+        }
+        let typed = PrintDraft { which: Which::Range, range: "1".into(), ..PrintDraft::default() };
+        assert_eq!(typed.settings(5, &labels).map(|s| s.pages), Ok(vec![3]));
     }
 
     #[test]

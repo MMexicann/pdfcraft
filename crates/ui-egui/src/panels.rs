@@ -1237,8 +1237,11 @@ fn fields(
     pages.sort();
     pages.dedup();
     for p in pages {
-        let label =
-            p.map(|p| crate::i18n::fmt(tl!("Page {label}"), &[("label", &info.pages[p].label)])).unwrap_or_else(|| tl!("Unplaced").to_string());
+        // A field's /P can name a page the document doesn't have (#1307); it reads as unplaced.
+        let label = p
+            .and_then(|p| info.pages.get(p))
+            .map(|page| crate::i18n::fmt(tl!("Page {label}"), &[("label", &page.label)]))
+            .unwrap_or_else(|| tl!("Unplaced").to_string());
         ui.add_space(4.0);
         ui.label(egui::RichText::new(label).font(theme::semibold(12.5)).color(t.text_muted));
         for f in ordered.iter().copied().filter(|f| f.page == p) {

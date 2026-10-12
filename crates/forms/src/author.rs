@@ -1033,8 +1033,9 @@ pub fn set_props(doc: &mut Document, name: &str, props: &FieldProps) -> Result<S
     if let Some(l) = &props.look {
         let arr = |c: [f64; 3]| Object::Array(c.iter().map(|v| Object::Real(v.clamp(0.0, 1.0))).collect());
         for w in &f.widgets {
+            // Resolved first: an indirect /MK keeps its mark, rotation and other entries.
+            let mut mk = doc.get(w.obj).as_dict().and_then(|d| d.get(b"MK").map(|m| doc.resolve(m).as_dict().cloned())).flatten().unwrap_or_default();
             doc.update_dict(w.obj, |d| {
-                let mut mk = d.get(b"MK").and_then(|m| m.as_dict().cloned()).unwrap_or_default();
                 match l.border {
                     Some(c) => mk.set(b"BC".to_vec(), arr(c)),
                     None => {

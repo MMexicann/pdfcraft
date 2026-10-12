@@ -27,11 +27,27 @@ same properties; invalid or overlapping ranges fail atomically. Untouched source
 survives. OpenType shaping uses the selected/source face's substitution and positioning
 rules, preserves marks and ligatures, and applies Unicode bidi ordering for a single face.
 Logical text remains available after save/reopen through ToUnicode and ActualText.
+Added Arabic text records ActualText per shaped line for copying and searching in typing order.
+ActualText already supplies typing order, so the editor preserves it without applying
+a second bidi reversal; adjacent visual glyph runs still recover their own reading order.
+Only right-to-left ActualText is kept apart this way: left-to-right spans, such as the Latin
+ligatures (`fi`, `fl`) Word and Chrome wrap in ActualText mid-word, join their line as before.
 
 For headless editing, use `text_font_files` → `text_font_import` → `text_fonts` and pass a
 resource to `text_edit.font_resource`. `text_edit.ranges` holds selected range formatting.
 `text_edit_layout` accepts resource/ranges too and measures a draft without applying it.
 All file inputs respect CLI root confinement; importing a font and applying text are undoable.
+
+On a scanned page, recognised text (Scan & OCR) is an invisible layer over the picture. Edit
+text groups it into phrases: words joined by a word space, with a table cell, a tab stop and each
+scanned line kept apart. Applying an edit draws the new text visibly in the scan's ink colour (or
+the one chosen) and first covers the old words with the paper colour sampled around them. Each
+word keeps its position and width, and a longer phrase grows rightwards rather than wrapping. The
+cover is one flat colour, and the text uses the layer's Helvetica, not the scanned typeface.
+This applies to any invisible text (rendering mode 3), not just a PdfCraft OCR layer: editing
+invisible text, such as another OCR tool's layer, makes the rewritten paragraph visible over a
+painted cover in the sampled paper colour. Edit text also groups invisible text differently: its lines never
+merge into multi-line paragraphs, and words split at gaps of 0.6 em or more.
 
 Explicit marked paragraph/heading scopes prevent unrelated tagged regions from merging.
 Compatible geometry groups untagged content, including runs split across content streams

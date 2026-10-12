@@ -401,6 +401,32 @@ fn may_paint_rect(rect: Rect, transform: Affine, width: u16, height: u16) -> boo
     paints_canvas(device, width, height)
 }
 
+/// PdfCraft patch: the whole-pixel device rectangle of a shrunk, axis-aligned image, as
+/// `(width, height, x0, y0)`. `transform` maps source pixels to device pixels and `planned` is the
+/// size [`image_resampling_size`] chose; `None` (draw as before) for rotated, skewed or flipped
+/// images, non-finite geometry, or a snapped size that strays more than a pixel from `planned`
+/// (so the memory budget that size passed still holds).
+fn snap_minified_image(
+    transform: &Affine,
+    source: (u32, u32),
+    planned: (u32, u32),
+) -> Option<(u32, u32, f64, f64)> {
+    let [a, b, c, d, e, f] = transform.as_coeffs();
+    let tiny = 1e-4 * a.abs().max(d.abs());
+    if !(a > 0.0 && d > 0.0 && b.abs() <= tiny && c.abs() <= tiny) {
+        return None;
+    }
+    let edge = |origin: f64, scale: f64, side: u32| {
+        let (lo, hi) = (origin.round(), (origin + scale * f64::from(side)).round());
+        (hi - lo >= 1.0 && lo.abs() < 1e6 && hi.abs() < 1e6).then_some((lo, hi))
+    };
+    let (x0, x1) = edge(e, a, source.0)?;
+    let (y0, y1) = edge(f, d, source.1)?;
+    // Bounded by the 1e6 check above, so the casts cannot saturate.
+    let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+    (w.abs_diff(planned.0) <= 1 && h.abs_diff(planned.1) <= 1).then_some((w, h, x0, y0))
+}
+
 pub(crate) struct Renderer {
     pub(crate) ctx: RenderContext,
     /// PdfCraft patch: when set, solid text and line-art paint colours are remapped
@@ -784,6 +810,20 @@ impl Renderer {
         if requested_resize && self.in_type3_glyph && interpolate {
             quality = ImageQuality::High;
         }
+        // PdfCraft patch: an axis-aligned, interpolated image that is shrunk lands on whole device
+        // pixels. It is shrunk once to exactly its snapped device rectangle and drawn 1:1 at the
+        // snapped corner. Otherwise the shrunk raster (rounded up to a whole size) is sampled a
+        // second time at a fractional scale and offset, which blurs scans and photos.
+        let snapped = if interpolate
+            && requested_resize
+            && !self.in_type3_glyph
+            && (new_width, new_height) != (source_width, source_height)
+        {
+            snap_minified_image(&cur_transform, (source_width, source_height), (new_width, new_height))
+        } else {
+            None
+        };
+        let (new_width, new_height) = snapped.map_or((new_width, new_height), |s| (s.0, s.1));
         let needs_resize = (new_width, new_height) != (source_width, source_height);
 
         // PdfCraft patch (#624): a minified image with a soft mask that is not interpolated is
@@ -932,11 +972,11 @@ impl Renderer {
             img_height as u16,
             may_have_transparency,
         );
-        self.draw_pixmap(
-            Arc::new(pixmap),
-            quality,
-            cur_transform * additional_transform,
-        );
+        let draw_transform = match snapped {
+            Some((_, _, x0, y0)) => Affine::translate((x0, y0)),
+            None => cur_transform * additional_transform,
+        };
+        self.draw_pixmap(Arc::new(pixmap), quality, draw_transform);
     }
 
     fn push_clip_path_inner(&mut self, clip_path: &BezPath, fill: FillRule) {

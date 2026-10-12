@@ -156,6 +156,36 @@ fn a_field_with_a_null_value_is_unsigned_and_can_be_signed() {
     }
 }
 
+/// Follow-up to #1374: a signature field whose /V is neither null nor a signature dictionary is
+/// refused by name with an error saying so, instead of being overwritten or called signed.
+#[test]
+fn a_field_whose_value_is_not_a_signature_is_refused_by_name() {
+    let id = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
+    let field = pdfcraft_cos::ObjRef { num: 6, generation: 0 };
+    let values = [
+        ("empty string", Object::String(PdfString::literal(""))),
+        ("number", Object::Int(5)),
+        ("name", Object::name("Off")),
+        ("array", Object::Array(Vec::new())),
+    ];
+    for (what, value) in values {
+        let direct = edit_after(&fixture(), |doc| doc.update_dict(field, |d| d.set(b"V".to_vec(), value.clone())).unwrap());
+        let indirect = edit_after(&fixture(), |doc| {
+            let v = doc.add(value.clone());
+            doc.update_dict(field, |d| d.set(b"V".to_vec(), Object::Ref(v))).unwrap();
+        });
+        for (how, bytes) in [("direct", direct), ("indirect", indirect)] {
+            let doc = open(&bytes);
+            let listed = signatures(&doc, &bytes, &TrustStore::default());
+            assert!(listed.iter().any(|s| s.field == "Approval" && !s.signed), "{how} {what}");
+            match pdfcraft_sign::sign(&doc, &id, &SignOptions { field: Some("Approval".into()), ..opts() }) {
+                Err(SignError::Pdf(e)) => assert_eq!(e, "the value of the field \"Approval\" is not a signature", "{how} {what}"),
+                other => panic!("{how} {what}: {:?}", other.map(|b| b.len())),
+            }
+        }
+    }
+}
+
 /// Append a revision that changes object `num` with `f`.
 fn edit_after(signed: &[u8], f: impl FnOnce(&mut Document)) -> Vec<u8> {
     let mut doc = open(signed);

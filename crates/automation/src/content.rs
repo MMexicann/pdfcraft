@@ -164,6 +164,9 @@ impl Automation {
                 if a.get("text").is_some() {
                     return Err(bad("images have no text"));
                 }
+                if ["font", "size", "bold", "italic", "color", "align"].iter().any(|k| a.get(k).is_some()) {
+                    return Err(bad("font, size, bold, italic, color and align apply to text"));
+                }
                 if let Some(deg) = a.opt_int("rotate")? {
                     if deg.rem_euclid(90) != 0 {
                         return Err(bad("rotate must be a multiple of 90"));

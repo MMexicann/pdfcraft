@@ -390,6 +390,12 @@
 	Flip Vertical	Inverter verticalmente
 	Replace Image…	Substituir imagem…
 	Save Image As…	Salvar imagem como…
+	Copy Image	Copiar imagem
+	The image has been copied ({w} × {h} pixels)	A imagem foi copiada ({w} × {h} pixels)
+	Couldn't copy the image: {e}	Não foi possível copiar a imagem: {e}
+	Copy Image in Original Format	Copiar imagem no formato original
+	The image has been copied as a {ext} file	A imagem foi copiada como arquivo {ext}
+	The page has changed; select the image again	A página mudou; selecione a imagem novamente
 	Check for updates	Verificar atualizações
 	No check has run yet.	Nenhuma verificação foi executada ainda.
 	Checking for a newer version…	Verificando se há uma versão mais recente…

@@ -13,18 +13,22 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod actions;
+pub mod autotag;
 pub mod camera;
 pub mod camera_clean;
 pub mod camera_edges;
 pub mod catalog;
 pub mod commands;
 pub mod compare;
+mod copy_image;
 pub mod dates;
 pub mod export;
 pub mod js;
 pub mod links;
 pub mod ocr;
 pub mod optimizer;
+pub mod printcheck;
+mod scan_colours;
 pub mod signature_image;
 pub mod signature_scan;
 pub mod text_fonts;
@@ -247,6 +251,47 @@ struct Editor {
     /// runs (content edits leave every annotation dictionary alone). Cleared on any refresh
     /// that may change annotations; see [`AppearanceCache`].
     appearances: AppearanceCache,
+    /// The text blocks last computed for one page, reused while the document is unchanged.
+    text_blocks: TextBlocksCache,
+}
+
+/// One page's text blocks ([`pdfcraft_edit::text_blocks`]) and the unmodified document state they
+/// were read from. Opening a paragraph and applying its edit both need them, and grouping a long
+/// page is not cheap. Only an unmodified document is cached: its identity changes on every edit,
+/// undo and save (each reopens the working file), so a stale entry never matches.
+#[derive(Default)]
+struct TextBlocksCache(std::sync::Mutex<Option<CachedTextBlocks>>);
+
+/// The document state, the page (0-based) and its text blocks.
+type CachedTextBlocks = (pdfcraft_cos::SourceIdentity, usize, Arc<Vec<pdfcraft_edit::TextBlock>>);
+
+impl Clone for TextBlocksCache {
+    fn clone(&self) -> Self {
+        // A poisoned cache only loses the cached blocks.
+        Self(std::sync::Mutex::new(self.0.lock().ok().and_then(|c| c.clone())))
+    }
+}
+
+impl Editor {
+    /// The text blocks on `page` (0-based), from the cache when the document hasn't changed.
+    fn text_blocks(&self, page: usize) -> Result<Arc<Vec<pdfcraft_edit::TextBlock>>, EditError> {
+        let source = (!self.cos.is_modified()).then(|| self.cos.source_identity());
+        if let Some(source) = &source
+            && let Ok(cache) = self.text_blocks.0.lock()
+            && let Some((s, p, blocks)) = cache.as_ref()
+            && s == source
+            && *p == page
+        {
+            return Ok(blocks.clone());
+        }
+        let blocks = Arc::new(pdfcraft_edit::text_blocks(&self.cos, page)?);
+        if let Some(source) = source
+            && let Ok(mut cache) = self.text_blocks.0.lock()
+        {
+            *cache = Some((source, page, blocks.clone()));
+        }
+        Ok(blocks)
+    }
 }
 
 pub struct Document {
@@ -440,7 +485,7 @@ impl Document {
 
     /// Edit a PDF ▸ Edit text: the paragraphs on `page` (0-based).
     pub fn text_blocks(&self, page: usize) -> Vec<pdfcraft_edit::TextBlock> {
-        self.editor.as_ref().and_then(|e| pdfcraft_edit::text_blocks(&e.cos, page).ok()).unwrap_or_default()
+        self.editor.as_ref().and_then(|e| e.text_blocks(page).ok()).map(|b| b.as_ref().clone()).unwrap_or_default()
     }
 
     /// Saved measurement annotations, calculated from their geometry and PDF scales, plus
@@ -692,6 +737,12 @@ impl Document {
     /// revision). Unsaved edits aren't a revision yet.
     pub fn revision_ends(&self) -> Vec<usize> {
         self.editor.as_ref().map(|e| e.cos.revision_ends()).unwrap_or_default()
+    }
+
+    /// The file as last opened or saved, without unsaved edits: what an incremental save appends
+    /// to.
+    pub fn saved_bytes(&self) -> Arc<Vec<u8>> {
+        self.editor.as_ref().map_or_else(|| self.bytes.clone(), |e| e.cos.bytes().clone())
     }
 
     /// Notes about damage repaired while opening (Document Properties ▸ Advanced, notices).
@@ -3018,7 +3069,17 @@ impl Session {
         let (mut editor, read_only_reason) = match cos {
             Ok(Ok(cos)) => {
                 let keys = Keys { render: render_password.clone(), reopen: password.map(str::to_owned) };
-                (Some(Editor { cos, undo: Vec::new(), redo: Vec::new(), keys, appearances: AppearanceCache::default() }), None)
+                (
+                    Some(Editor {
+                        cos,
+                        undo: Vec::new(),
+                        redo: Vec::new(),
+                        keys,
+                        appearances: AppearanceCache::default(),
+                        text_blocks: TextBlocksCache::default(),
+                    }),
+                    None,
+                )
             }
             Ok(Err(e)) => (None, Some(e.to_string())),
             Err(_) => (None, Some("the document structure could not be read for editing".into())),
@@ -3114,6 +3175,23 @@ impl Session {
         if let Some(p) = editor.cos.permissions() {
             check_permission(&edit, &p)?;
         }
+        // Rewriting an OCR word (invisible text over a scan) also hides the scanned word: cover it
+        // in the paper's colour and draw the new text in the ink's.
+        let edit = match edit {
+            Edit::EditTextBlock { page, block, text, mut style } => {
+                // Only invisible text is sampled; the blocks are usually cached from opening it.
+                if style.cover.is_none()
+                    && let Some(info) = doc.info.pages.get(page)
+                    && let Some(b) = editor.text_blocks(page).ok().and_then(|b| b.get(block).filter(|b| b.invisible).cloned())
+                    && let Some((paper, ink)) = guard(|| scan_colours::sample(&editor.cos, info, page, &b)).ok().flatten()
+                {
+                    style.cover = Some(paper);
+                    style.color = style.color.or(Some(ink));
+                }
+                Edit::EditTextBlock { page, block, text, style }
+            }
+            other => other,
+        };
         // Nothing to bake: leave undo history and the dirty flag alone.
         if matches!(&edit, Edit::FlattenFillSign) && !pdfcraft_annot::has_visible_fill_sign(&editor.cos) {
             return Ok(());

@@ -761,6 +761,12 @@
 	Flip Vertical	上下反転
 	Replace Image…	画像を置換…
 	Save Image As…	画像を別名で保存…
+	Copy Image	画像をコピー
+	The image has been copied ({w} × {h} pixels)	画像をコピーしました（{w} × {h} ピクセル）
+	Couldn't copy the image: {e}	画像をコピーできませんでした: {e}
+	Copy Image in Original Format	画像を元の形式でコピー
+	The image has been copied as a {ext} file	画像を {ext} ファイルとしてコピーしました
+	The page has changed; select the image again	ページが変更されました。画像をもう一度選択してください
 	Check for updates	アップデートを確認
 	No check has run yet.	まだ確認していません。
 	Checking for a newer version…	新しいバージョンを確認中…

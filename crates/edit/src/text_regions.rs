@@ -35,6 +35,19 @@ pub(super) fn group_reading_blocks(lines: &[TextLine]) -> Vec<TextBlock> {
     group_layout(lines, false)
 }
 
+/// Text-space units → user space along the baseline. It is the vertical scale ([`Origin::k`])
+/// unless the text matrix stretches the glyphs, as an OCR layer fitting each word to the scan does.
+fn across(line: &TextLine) -> f64 {
+    let m = Matrix(line.origin.tm).then(&Matrix(line.origin.ctm)).0;
+    let h = m[0].hypot(m[1]);
+    if h.is_finite() && h > 1e-9 { h } else { line.origin.k }
+}
+
+/// Invisible text (rendering mode 3), as in an OCR layer over a scanned image.
+fn invisible(line: &TextLine) -> bool {
+    line.origin.state.render_mode == 3
+}
+
 fn same_style(a: &TextLine, b: &TextLine) -> bool {
     same_font(a, b.font.as_bytes(), b.face.as_deref())
         && a.base_font == b.base_font
@@ -50,7 +63,11 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
     for (i, line) in lines.iter().enumerate() {
         let joins = rows.last().and_then(|r| r.last()).and_then(|i| lines.get(*i)).is_some_and(|prev| {
             let gap = line.rect[0] - prev.rect[2];
-            (mixed || same_style(prev, line))
+            // OCR words (invisible text over a scan) join only across a word space: a wider gap
+            // is a table cell or a tab stop, which a rewrite would close up.
+            let scanned = !mixed || (invisible(prev) == invisible(line) && (!invisible(line) || gap < prev.size.max(line.size) * 0.6));
+            scanned
+                && (mixed || same_style(prev, line))
                 && same_plane(prev, line)
                 && (prev.origin.baseline - line.origin.baseline).abs() < prev.size.min(line.size) * 0.2
                 && gap >= -prev.size.min(line.size) * 0.2
@@ -81,7 +98,9 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
             let gap = prev.origin.baseline - first.origin.baseline;
             let tol = prev.size.max(first.size).max(1.0);
             let aligned = (pr[0] - rect[0]).abs() < tol || ((pr[0] + pr[2] - rect[0] - rect[2]) / 2.0).abs() < tol || (pr[2] - rect[2]).abs() < tol;
-            (mixed || same_style(prev, first))
+            // OCR lines stay apart: the scan fixes where each one is, so they never rewrap together.
+            (!mixed || !(invisible(prev) || invisible(first)))
+                && (mixed || same_style(prev, first))
                 && same_plane(prev, first)
                 && aligned
                 && first.size.min(prev.size) >= first.size.max(prev.size) * 0.4
@@ -102,6 +121,7 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
                 rotation: first.rotation(),
                 lines: Vec::new(),
                 rows: Vec::new(),
+                invisible: true,
             });
         }
         let Some(block) = blocks.last_mut() else { continue };
@@ -124,6 +144,7 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
             block.editor_text.push_str(&line.text);
             block.spans.push((start..block.editor_text.len(), index));
             row_text.push_str(&line.text);
+            block.invisible &= line.origin.state.render_mode == 3;
             block.lines.push(index);
         }
         if !block.text.is_empty() {
@@ -310,7 +331,13 @@ pub(super) fn rewrite_styled_block(
     if !dx.is_finite() || !dy.is_finite() || style.width.is_some_and(|w| !w.is_finite()) {
         return Err(EditError::Invalid("the paragraph's position and width must be finite".into()));
     }
-    let width = style.width.unwrap_or(block.rect[2] - block.rect[0]).clamp(1.0, 14_400.0);
+    // A rewritten OCR line grows to the right rather than wrapping onto the scanned line below.
+    let natural = if block.invisible {
+        (p.crop(doc)[2] - 36.0 - (block.rect[0] + dx)).max(block.rect[2] - block.rect[0])
+    } else {
+        block.rect[2] - block.rect[0]
+    };
+    let width = style.width.unwrap_or(natural).clamp(1.0, 14_400.0);
     // Each tuple is a character, its source style and an encodable resource name.
     let mut chars = Vec::new();
     let mut substituted = None;
@@ -405,7 +432,7 @@ pub(super) fn rewrite_styled_block(
                 source.origin.state.char_spacing,
                 source.origin.state.word_spacing,
             ) * source.origin.state.scale
-                * source.origin.k;
+                * across(source);
             let changed_face = style.resource.is_some() || overrides.get(&index).is_some_and(|r| r.family.is_some() || r.resource.is_some());
             let factor = if nominal > 0.0 && !changed_face { ((source.rect[2] - source.rect[0]) / nominal).clamp(0.5, 2.0) } else { 1.0 };
             calibration.insert(index, factor);
@@ -426,7 +453,7 @@ pub(super) fn rewrite_styled_block(
                 .map_or(source.origin.state.char_spacing, |c| c / source.origin.k.max(1e-6)),
             source.origin.state.word_spacing,
         ) * overrides.get(&item.1).and_then(|r| r.scale).or(style.scale).map_or(source.origin.state.scale, |s| (s / 100.0).clamp(0.1, 10.0))
-            * source.origin.k
+            * across(source)
             * calibration.get(&item.1).copied().unwrap_or(1.0)
     };
     let measure = |items: &[(char, usize, String)]| -> Result<f64, EditError> {
@@ -530,6 +557,7 @@ pub(super) fn rewrite_styled_block(
     }
     let n = pdfcraft_content::num;
     let mut block_ops = vec![Op::new("q", vec![])];
+    block_ops.extend(reveal_ops(block, lines, style, first.origin.ctm)?);
     let back = Matrix([first.origin.ctm[0], first.origin.ctm[1], first.origin.ctm[2], first.origin.ctm[3], 0.0, 0.0])
         .invert()
         .ok_or_else(|| EditError::Invalid("the paragraph is drawn in a space it cannot be edited in".into()))?;
