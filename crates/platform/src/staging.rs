@@ -42,7 +42,14 @@ pub fn create_staging(
             StagingName::SuffixThenTag => format!(".{stem}.{suffix:016x}.pdfcraft-tmp"),
             StagingName::TagThenSuffix => format!(".{stem}.pdfcraft-{suffix:016x}.tmp"),
         });
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&tmp) {
             Ok(file) => return Ok((tmp, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             // Windows reports a folder at the name as "access denied"; it is taken all the same.
@@ -51,6 +58,21 @@ pub fn create_staging(
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "every temporary file name tried is taken"))
+}
+
+/// Keep an existing Unix destination's access permissions on its replacement. Call after
+/// writing, while the staging file is still open, and before flushing/closing/publishing it.
+/// The handle prevents a replaced staging path from redirecting the permission change.
+/// New files keep the private creation mode. This does not copy ownership or POSIX/Windows ACLs.
+pub fn preserve_destination_permissions(_file: &std::fs::File, _target: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    match std::fs::metadata(_target) {
+        Ok(metadata) if metadata.is_file() => _file.set_permissions(metadata.permissions())?,
+        Ok(_) => {} // The caller's rename reports a non-file destination normally.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 /// Unpredictable staging-name suffixes, so a name can't be planted in advance. Each is the
@@ -125,5 +147,46 @@ mod tests {
         assert!(create_staging(&dir, "out.pdf", StagingName::SuffixThenTag, 1..).is_err());
         assert!(!name(STAGING_ATTEMPTS as u64 + 1).exists(), "a 17th name was tried");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn private_staging_and_destination_modes_under_a_permissive_umask() {
+        let dir = test_dir("unix-permissions");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "umask 022; exec \"$@\"", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "staging::tests::staging_permissions_child", "--nocapture", "--test-threads=1"])
+            .env("PDFCRAFT_STAGING_PERMISSIONS_TEST", &dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_permissions_child() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let Some(dir) = std::env::var_os("PDFCRAFT_STAGING_PERMISSIONS_TEST") else { return };
+        let dir = PathBuf::from(dir);
+        for (index, mode) in [Some(0o600), Some(0o640), None].into_iter().enumerate() {
+            let name = format!("saved-{index}.pdf");
+            let target = dir.join(&name);
+            if let Some(mode) = mode {
+                std::fs::write(&target, b"original").unwrap();
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            for form in [StagingName::SuffixThenTag, StagingName::TagThenSuffix] {
+                let (tmp, mut file) = create_staging(&dir, &name, form, [index as u64]).unwrap();
+                assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600, "unpublished staging must be private");
+                file.write_all(b"updated PDF").unwrap();
+                preserve_destination_permissions(&file, &target).unwrap();
+                drop(file);
+                std::fs::rename(tmp, &target).unwrap();
+                assert_eq!(std::fs::read(&target).unwrap(), b"updated PDF");
+                assert_eq!(target.metadata().unwrap().permissions().mode() & 0o777, mode.unwrap_or(0o600));
+            }
+        }
     }
 }

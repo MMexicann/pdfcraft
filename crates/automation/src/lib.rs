@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pdfcraft_engine::{CombineSource, DocId, Document, Edit, Session, commands};
-use pdfcraft_platform::staging::{StagingName, create_staging, staging_suffixes};
+use pdfcraft_platform::staging::{StagingName, create_staging, preserve_destination_permissions, staging_suffixes};
 use pdfcraft_render::{PageRenderer, PageText, RenderConfig, RenderRequest, RequestKind};
 use serde_json::{Value, json};
 
@@ -2322,7 +2322,7 @@ fn write_atomic_with(path: &Path, bytes: &[u8], suffixes: impl IntoIterator<Item
     // Closed at the end of the block, before the rename.
     let written = {
         let mut file = file;
-        file.write_all(bytes)
+        file.write_all(bytes).and_then(|()| preserve_destination_permissions(&file, path))
     };
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
@@ -2685,6 +2685,25 @@ mod tests {
         let mut names: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         names.sort();
         names
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_output_preserves_private_and_shared_destination_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = staging_dir("permissions");
+        for mode in [0o600, 0o640, 0o444] {
+            let target = dir.join(format!("{mode:o}.pdf"));
+            std::fs::write(&target, b"OLD").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
+            write_atomic_with(&target, b"NEW", [mode as u64]).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"NEW");
+            assert_eq!(target.metadata().unwrap().permissions().mode() & 0o777, mode);
+        }
+        let target = dir.join("new.pdf");
+        write_atomic_with(&target, b"NEW", [7]).unwrap();
+        assert_eq!(target.metadata().unwrap().permissions().mode() & 0o077, 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

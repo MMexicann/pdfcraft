@@ -2,7 +2,7 @@
 //! "save changes?" prompt when closing a tab or quitting with unsaved edits.
 
 use pdfcraft_engine::Edit;
-use pdfcraft_platform::staging::{StagingName, create_staging, staging_suffixes};
+use pdfcraft_platform::staging::{StagingName, create_staging, preserve_destination_permissions, staging_suffixes};
 
 use crate::PdfCraftApp;
 
@@ -944,6 +944,7 @@ fn write_atomically_syncing(
         {
             let mut f = f;
             f.write_all(bytes)?;
+            preserve_destination_permissions(&f, target)?;
             sync_staged(&f, sync_all)?;
         }
         std::fs::rename(&tmp, target)
@@ -1091,6 +1092,23 @@ mod tests {
         {
             Err(std::io::Error::other(format!("no symbolic links here: {} {}", target.display(), link.display())))
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_atomic_output_preserves_private_and_shared_destination_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pdfcraft-desktop-permissions-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for mode in [0o600, 0o640, 0o444] {
+            let target = dir.join(format!("{mode:o}.pdf"));
+            std::fs::write(&target, b"OLD").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
+            write_atomically_with(&target.to_string_lossy(), b"NEW", [mode as u64]).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"NEW");
+            assert_eq!(target.metadata().unwrap().permissions().mode() & 0o777, mode);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
