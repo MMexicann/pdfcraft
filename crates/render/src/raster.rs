@@ -2968,6 +2968,19 @@ trailer << /Root 1 0 R >>
         }
     }
 
+    #[test]
+    fn nonisolated_appearance_groups_keep_the_page_backdrop_for_multiply() {
+        let content = "0 g 100 40 10 20 re f";
+        let appearance = "/GS0 gs 1 1 0 rg 15 35 105 30 re f";
+        let bytes = format!("%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R /Annots [5 0 R] >> endobj\n4 0 obj << /Length {} >> stream\n{content}\nendstream endobj\n5 0 obj << /Type /Annot /Subtype /Highlight /Rect [15 35 120 65] /AP << /N 6 0 R >> >> endobj\n6 0 obj << /Type /XObject /Subtype /Form /BBox [15 35 120 65] /Group << /S /Transparency /I false /K false >> /Resources << /ExtGState << /GS0 << /BM /Multiply >> >> >> /Length {} >> stream\n{appearance}\nendstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF", content.len(), appearance.len()).into_bytes();
+        let mut renderer = PageRenderer::new(Arc::new(bytes), RenderConfig::default());
+        let page = renderer.render(RenderRequest { page: 0, scale: 1.0, ..Default::default() });
+        assert!(page.error.is_none(), "{:?}", page.error);
+        let pixel = |x: usize, y: usize| &page.rgba[(y * page.width as usize + x) * 4..][..4];
+        assert_eq!(pixel(105, 50), &[0, 0, 0, 255], "Multiply must see the black content beneath a non-isolated group");
+        assert_eq!(pixel(30, 50), &[255, 255, 0, 255]);
+    }
+
     /// A Highlight annotation without an appearance stream (common in older and generated files)
     /// was not drawn at all. Vendored hayro-interpret patch: its /QuadPoints are filled with /C at
     /// /CA, blended with Multiply, as PdfCraft draws its own highlights (pdfcraft-annot); MuPDF,

@@ -134,7 +134,21 @@ pub(crate) fn draw_form_xobject<'a, 'b>(
     context.pre_concat_affine(x_object.matrix);
     context.push_root_transform();
 
-    if x_object.is_transparency_group {
+    // PdfCraft patch: a non-isolated, non-knockout group with neutral outer compositing is equivalent to
+    // drawing its members into the current backdrop (ISO 32000-2 11.4.3). Wrapping it in an
+    // isolated device layer loses that backdrop: Multiply highlights then hide page text.
+    // Keep the layer for opacity, masks, non-Normal outer blending and isolated/knockout groups.
+    let state = &context.get().graphics_state;
+    let flatten_group = x_object.dict.get::<Dict<'_>>(GROUP).is_some_and(|group| {
+        !group.get::<bool>(b"I").unwrap_or(false)
+            && !group.get::<bool>(b"K").unwrap_or(false)
+            && state.non_stroke_alpha == 1.0
+            && state.stroke_alpha == 1.0
+            && state.blend_mode == BlendMode::Normal
+            && state.soft_mask.is_none()
+    });
+    let grouped = x_object.is_transparency_group && !flatten_group;
+    if grouped {
         device.push_transparency_group(
             context.get().graphics_state.non_stroke_alpha,
             std::mem::take(&mut context.get_mut().graphics_state.soft_mask),
@@ -169,7 +183,7 @@ pub(crate) fn draw_form_xobject<'a, 'b>(
 
     device.pop_clip_path();
 
-    if x_object.is_transparency_group {
+    if grouped {
         device.pop_transparency_group();
     }
 
