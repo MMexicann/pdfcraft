@@ -126,6 +126,35 @@ fn path_from_arg(arg: String) -> String {
     String::from_utf8(out).unwrap_or(arg)
 }
 
+/// Some programs start the PDF reader with the path unquoted (`pdfcraft.exe P:\Docs\01 Contract.PDF`),
+/// so a path with spaces arrives split into several arguments (Acrobat accepts this). When an
+/// argument names no file but it and the ones after it, joined with one space, do, rejoin them
+/// (the longest such run). Anything else is kept as given. Runs of several spaces can't be recovered: the split has lost them.
+fn rejoin_split_paths(args: Vec<String>, exists: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while let Some(first) = args.get(i) {
+        if exists(first) {
+            out.push(first.clone());
+            i += 1;
+            continue;
+        }
+        // The longest run starting here that names a file; capped so a long list stays cheap.
+        let end = (i + 2..=args.len().min(i + 32)).rev().find(|&j| args.get(i..j).is_some_and(|run| exists(&run.join(" "))));
+        match end.and_then(|j| Some((j, args.get(i..j)?.join(" ")))) {
+            Some((j, joined)) => {
+                out.push(joined);
+                i = j;
+            }
+            None => {
+                out.push(first.clone());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 fn main() -> eframe::Result {
     // First, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
@@ -155,7 +184,7 @@ fn main() -> eframe::Result {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--version" => {
-                println!("pdfcraft {}", env!("CARGO_PKG_VERSION"));
+                println!("pdfcraft {}", pdfcraft_engine::build_info::version());
                 return Ok(());
             }
             "--control" => control_file = args.next(),
@@ -168,6 +197,7 @@ fn main() -> eframe::Result {
             _ => files.push(path_from_arg(a)),
         }
     }
+    let files = rejoin_split_paths(files, |p| std::path::Path::new(p).is_file());
     let integrated = cfg!(target_os = "macos");
     migrate_legacy_folders();
     // The log file lives in the settings folder; opened after the arguments (so `--version` leaves
@@ -175,7 +205,7 @@ fn main() -> eframe::Result {
     // Records logged until now are written to it first.
     if let (Some(logger), Some(dir)) = (logger, settings_dir()) {
         match logger.attach_dir(&dir.join("logs")) {
-            Ok(path) => log::info!("PdfCraft {}, log file {}", env!("CARGO_PKG_VERSION"), path.display()),
+            Ok(path) => log::info!("PdfCraft {}, log file {}", pdfcraft_engine::build_info::version(), path.display()),
             // Standard error only by now (`attach_dir` gave up on the file); unlike `eprintln!`, never panics.
             Err(e) => log::warn!("no log file: {e}"),
         }
@@ -484,6 +514,11 @@ fn write_control_file(path: &str, port: u16, token: &str) -> std::io::Result<()>
 ///   its window appeared. D3D12 is the native, best-supported backend there.
 fn configure_gpu(native: &mut eframe::NativeOptions) {
     let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut native.wgpu_options.wgpu_setup else { return };
+    // Nothing draws or dispatches indirectly, so wgpu's check of indirect arguments only costs a
+    // compute shader when the device is created, one that Metal can't compile on an Intel Iris
+    // Pro: the device is lost and the window falls back to OpenGL. `WGPU_VALIDATION_INDIRECT_CALL=1`
+    // turns the check back on.
+    setup.instance_descriptor.flags = setup.instance_descriptor.flags.difference(eframe::wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL).with_env();
     // egui-wgpu requests only 8192 pixels even when the adapter can render larger surfaces.
     // A restored 3440-point window at 250% DPI requests 8600 pixels and otherwise panics in
     // Surface::configure before the app starts. Keep the renderer's other device requirements,
@@ -728,6 +763,24 @@ mod tests {
     }
 
     #[test]
+    fn unquoted_paths_with_spaces_are_rejoined() {
+        let have = ["P:\\Archive\\00042A26 Contract.PDF", "C:\\a b c.pdf", "C:\\a.pdf", "C:\\x y.pdf"];
+        let exists = |p: &str| have.contains(&p);
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The case an office program produced: one path, split at its space.
+        assert_eq!(
+            super::rejoin_split_paths(args(&["P:\\Archive\\00042A26", "Contract.PDF"]), exists),
+            args(&["P:\\Archive\\00042A26 Contract.PDF"])
+        );
+        // The longest run wins; files that exist on their own are left alone.
+        assert_eq!(super::rejoin_split_paths(args(&["C:\\a", "b", "c.pdf", "C:\\a.pdf"]), exists), args(&["C:\\a b c.pdf", "C:\\a.pdf"]));
+        assert_eq!(super::rejoin_split_paths(args(&["C:\\a.pdf", "C:\\x", "y.pdf"]), exists), args(&["C:\\a.pdf", "C:\\x y.pdf"]));
+        // Nothing to join: kept as given, so the missing file is still reported by name.
+        assert_eq!(super::rejoin_split_paths(args(&["missing.pdf", "other"]), exists), args(&["missing.pdf", "other"]));
+        assert!(super::rejoin_split_paths(Vec::new(), exists).is_empty());
+    }
+
+    #[test]
     fn path_from_arg_leaves_plain_paths_and_other_schemes_alone() {
         assert_eq!(super::path_from_arg("report.pdf".to_string()), "report.pdf");
         assert_eq!(super::path_from_arg("/home/alice/report.pdf".to_string()), "/home/alice/report.pdf");
@@ -780,6 +833,10 @@ mod tests {
         };
         if std::env::var_os("WGPU_POWER_PREF").is_none() {
             assert_eq!(setup.power_preference, eframe::wgpu::PowerPreference::LowPower);
+        }
+        if std::env::var_os("WGPU_VALIDATION_INDIRECT_CALL").is_none() {
+            let flags = setup.instance_descriptor.flags;
+            assert!(!flags.contains(eframe::wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL), "Intel Metal can't compile its shader: {flags:?}");
         }
         if cfg!(target_os = "windows") && std::env::var_os("WGPU_BACKEND").is_none() {
             let backends = setup.instance_descriptor.backends;
