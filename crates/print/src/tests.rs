@@ -506,6 +506,10 @@ mod cups_options {
         let Some(record) = std::env::var_os(RECORD) else { return };
         let args: Vec<String> = std::env::args().skip_while(|a| a != "--").skip(1).collect();
         std::fs::write(std::path::Path::new(&record).join("args"), args.join("\n")).unwrap();
+        std::fs::write(std::path::Path::new(&record).join("pid"), std::process::id().to_string()).unwrap();
+        if std::env::var(ANSWER).unwrap() == "DELAY" {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
         println!("{}", std::env::var(ANSWER).unwrap());
     }
 
@@ -513,6 +517,68 @@ mod cups_options {
         let mut c = std::process::Command::new(std::env::current_exe().unwrap());
         c.args(["--exact", "tests::cups_options::stand_in_for_lpoptions", "--nocapture", "--"]).env(RECORD, record).env(ANSWER, answer);
         c
+    }
+
+    #[test]
+    fn printer_options_timeout_kills_and_reaps_the_unresponsive_command() {
+        let dir = folder();
+        let start = std::time::Instant::now();
+        let result = spool::printer_options_via_deadline(
+            "TestPrinter",
+            &dir,
+            command(&dir, "DELAY"),
+            std::time::Duration::from_millis(150),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert!(matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::TimedOut), "{result:?}");
+        assert!(start.elapsed() < std::time::Duration::from_millis(700));
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+        let alive = std::process::Command::new("kill").args(["-0", pid.trim()]).stderr(std::process::Stdio::null()).status().unwrap();
+        assert!(!alive.success(), "the owned helper must be reaped");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancelling_printer_options_reaps_the_child() {
+        let dir = folder();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                spool::printer_options_via_deadline("TestPrinter", &dir, command(&dir, "DELAY"), std::time::Duration::from_secs(5), &cancel)
+            });
+            let start = std::time::Instant::now();
+            while !dir.join("pid").exists() && start.elapsed() < std::time::Duration::from_secs(2) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(dir.join("pid").exists());
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            worker.join().unwrap()
+        });
+        assert!(matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted), "{result:?}");
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+        assert!(!std::process::Command::new("kill").args(["-0", pid.trim()]).stderr(std::process::Stdio::null()).status().unwrap().success());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_lpoptions_keeps_the_ppd_options() {
+        let dir = folder();
+        std::fs::write(
+            dir.join("TestPrinter.ppd"),
+            "*OpenUI *InputSlot/Paper tray: PickOne\n*DefaultInputSlot: Auto\n*InputSlot Auto/Automatic: \"\"\n*CloseUI: *InputSlot\n",
+        )
+        .unwrap();
+        let options = spool::printer_options_via_deadline(
+            "TestPrinter",
+            &dir,
+            std::process::Command::new(dir.join("does-not-exist")),
+            std::time::Duration::from_secs(1),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].default, "Auto");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn folder() -> std::path::PathBuf {

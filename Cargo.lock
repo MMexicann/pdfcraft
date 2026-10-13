@@ -4195,6 +4195,7 @@ dependencies = [
  "pdfcraft-content",
  "pdfcraft-cos",
  "pdfcraft-model",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 

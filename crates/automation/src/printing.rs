@@ -27,7 +27,8 @@ impl Automation {
 
     pub(crate) fn printer_options(&self, a: &Args) -> Result<Value> {
         let printer = a.str("printer")?;
-        let list: Vec<Value> = spool::printer_options(printer)
+        let list: Vec<Value> = spool::printer_options_checked(printer, &std::sync::atomic::AtomicBool::new(false))
+            .map_err(|error| failed(error.to_string()))?
             .into_iter()
             .map(|o| {
                 let choices: Vec<Value> = o.choices.iter().map(|(value, label)| json!({ "value": value, "label": label })).collect();

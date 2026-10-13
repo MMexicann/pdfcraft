@@ -78,6 +78,10 @@ pub struct PrintDraft {
     pub show_driver_options: bool,
     /// Why the printer's preferences window didn't open (Windows).
     pub driver_error: Option<String>,
+    /// Properties lookup requested by the dialog, consumed by the background task poll.
+    pub driver_request: Option<String>,
+    pub driver_request_id: Option<u64>,
+    pub driver_loading: bool,
 }
 
 impl Default for PrintDraft {
@@ -118,6 +122,9 @@ impl Default for PrintDraft {
             driver_choices: Default::default(),
             show_driver_options: false,
             driver_error: None,
+            driver_request: None,
+            driver_request_id: None,
+            driver_loading: false,
         }
     }
 }
@@ -187,10 +194,32 @@ pub fn system_printers() -> PrinterSource {
     std::sync::Arc::new(spool::printers)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+type OptionsSource = std::sync::Arc<dyn Fn(&str, &std::sync::atomic::AtomicBool) -> Result<Vec<spool::PrinterOption>, String> + Send + Sync>;
+
+#[cfg(not(target_arch = "wasm32"))]
+struct OptionsTask {
+    id: u64,
+    printer: String,
+    receiver: std::sync::mpsc::Receiver<Result<Vec<spool::PrinterOption>, String>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for OptionsTask {
+    fn drop(&mut self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The Print dialog's work in the background: the printer list being read, and the jobs being
 /// spooled (the printer each was sent to, and the spooler's answer).
 #[derive(Default)]
 pub(crate) struct PrintTasks {
+    #[cfg(not(target_arch = "wasm32"))]
+    options: Option<OptionsTask>,
+    #[cfg(not(target_arch = "wasm32"))]
+    options_serial: u64,
     #[cfg(not(target_arch = "wasm32"))]
     printers: Option<std::sync::mpsc::Receiver<Vec<spool::Printer>>>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -286,12 +315,102 @@ impl PdfCraftApp {
         self.print_tasks.printers = Some(rx);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_driver_options_with(&mut self, printer: String, source: OptionsSource) {
+        if self.print_tasks.options.is_some() {
+            return;
+        }
+        let Some(id) = self.print_tasks.options_serial.checked_add(1) else {
+            self.print_draft.driver_error = Some("too many printer property requests".into());
+            self.print_draft.driver_loading = false;
+            return;
+        };
+        self.print_tasks.options_serial = id;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let read_for = printer.clone();
+        let ctx = self.ctx.clone();
+        let spawn = std::thread::Builder::new().name("printer-properties".into()).spawn(move || {
+            let result = source(&read_for, &worker_cancel);
+            let _ = sender.send(result);
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+        if let Err(error) = spawn {
+            self.print_draft.driver_error = Some(format!("printer properties could not start: {error}"));
+            self.print_draft.driver_loading = false;
+            return;
+        }
+        self.print_draft.driver_request_id = Some(id);
+        self.print_draft.driver_loading = true;
+        self.print_tasks.options = Some(OptionsTask { id, printer, receiver, cancel });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_driver_options(&mut self) {
+        if let Some(task) = &self.print_tasks.options {
+            if !matches!(self.dialog, Some(crate::Dialog::Print))
+                || self.print_draft.printer.as_deref() != Some(task.printer.as_str())
+                || !self.print_draft.show_driver_options
+                || self.print_draft.driver_request.is_some()
+            {
+                task.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.print_draft.driver_request_id = None;
+            }
+            let result = match task.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err("printer property lookup stopped unexpectedly".into())),
+            };
+            if let Some(result) = result {
+                let valid = self.print_draft.driver_request_id == Some(task.id) && matches!(self.dialog, Some(crate::Dialog::Print));
+                let printer = task.printer.clone();
+                self.print_tasks.options = None;
+                if !valid && self.print_draft.driver_request.is_none() {
+                    self.print_draft.driver_loading = false;
+                }
+                if valid {
+                    let d = &mut self.print_draft;
+                    d.driver_loading = false;
+                    d.driver_request_id = None;
+                    match result {
+                        Ok(options) => {
+                            d.driver_options = Some((printer, options));
+                            d.driver_choices.clear();
+                            d.driver_error = None;
+                        }
+                        Err(error) => d.driver_error = Some(error),
+                    }
+                }
+            }
+        }
+        // Keep one worker at a time. A switched printer waits for cancellation to finish.
+        if self.print_tasks.options.is_none()
+            && let Some(printer) = self.print_draft.driver_request.take()
+        {
+            if matches!(self.dialog, Some(crate::Dialog::Print))
+                && self.print_draft.show_driver_options
+                && self.print_draft.printer.as_deref() == Some(printer.as_str())
+            {
+                self.start_driver_options_with(
+                    printer,
+                    std::sync::Arc::new(|printer, cancel| spool::printer_options_checked(printer, cancel).map_err(|error| error.to_string())),
+                );
+            } else {
+                self.print_draft.driver_loading = false;
+            }
+        }
+    }
+
     /// Pick up a printer list or a spooled job that finished (each frame).
     pub(crate) fn poll_print(&mut self) {
         #[cfg(target_arch = "wasm32")]
         self.poll_web_print();
         #[cfg(not(target_arch = "wasm32"))]
         {
+            self.poll_driver_options();
             if let Some(rx) = &self.print_tasks.printers {
                 let printers = match rx.try_recv() {
                     Ok(p) => Some(p),
@@ -685,7 +804,7 @@ pub(crate) fn body(
                     } else {
                         tl!("The printer driver's own settings for this print: paper tray, paper type, finishing and more.")
                     };
-                    let properties = ui.add_enabled(d.printer.is_some() && !browser, egui::Button::new(tl!("Properties…"))).on_hover_text(tip);
+                    let properties = ui.add_enabled(d.printer.is_some() && !browser && !d.driver_loading, egui::Button::new(tl!("Properties…"))).on_hover_text(tip);
                     if properties.clicked()
                         && let Some(p) = d.printer.clone()
                     {
@@ -693,8 +812,9 @@ pub(crate) fn body(
                             d.driver_error = spool::open_printer_preferences(&p).err().map(|e| e.to_string());
                         } else {
                             if d.driver_options.as_ref().is_none_or(|(read_for, _)| *read_for != p) {
-                                d.driver_options = Some((p.clone(), spool::printer_options(&p)));
-                                d.driver_choices.clear();
+                                d.driver_request = Some(p.clone());
+                                d.driver_request_id = None;
+                                d.driver_loading = true;
                             }
                             d.show_driver_options = !d.show_driver_options;
                         }
@@ -704,6 +824,9 @@ pub(crate) fn body(
                     d.printer_picked = true;
                     d.show_driver_options = false;
                     d.driver_error = None;
+                    d.driver_request = None;
+                    d.driver_request_id = None;
+                    d.driver_loading = false;
                 }
                 ui.end_row();
                 ui.label(tl!("Copies:"));
@@ -753,7 +876,8 @@ pub(crate) fn body(
                 ui.label(egui::RichText::new(crate::i18n::fmt(tl!("Couldn't open the printer's preferences: {e}"), &[("e", e)])).small().color(t.text_muted));
             }
             if d.show_driver_options {
-                driver_options_panel(ui, d, t);
+                if d.driver_loading { ui.spinner(); }
+                else { driver_options_panel(ui, d, t); }
             }
             if let Some(&source) = sizes.get(d.current_page) {
                 ui.horizontal_wrapped(|ui| {
@@ -1027,6 +1151,79 @@ pub(crate) fn body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn printer_properties_do_not_block_the_frame_and_complete_in_the_dialog() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let mut app = PdfCraftApp::new();
+        app.dialog = Some(crate::Dialog::Print);
+        app.print_draft.printer = Some("TestPrinter".into());
+        app.print_draft.show_driver_options = true;
+        let (sender, receiver) = mpsc::channel::<()>();
+        let gate = Arc::new(Mutex::new(receiver));
+        let completed = Arc::new(AtomicBool::new(false));
+        let mark = completed.clone();
+        app.start_driver_options_with(
+            "TestPrinter".into(),
+            Arc::new(move |_, _| {
+                let _ = gate.lock().unwrap().recv_timeout(std::time::Duration::from_secs(2));
+                mark.store(true, Ordering::SeqCst);
+                Ok(Vec::new())
+            }),
+        );
+        assert!(!completed.load(Ordering::SeqCst), "the UI call returned before the printer answered");
+        assert!(app.print_draft.driver_loading);
+        app.poll_driver_options(); // Another frame is free to run while the lookup waits.
+        assert!(app.print_draft.driver_options.is_none());
+        sender.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while app.print_tasks.options.is_some() && start.elapsed() < std::time::Duration::from_secs(2) {
+            app.poll_driver_options();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.print_draft.driver_loading);
+        assert_eq!(app.print_draft.driver_options.as_ref().map(|o| o.0.as_str()), Some("TestPrinter"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn switching_or_closing_cancels_properties_and_discards_the_stale_result() {
+        for close in [false, true] {
+            let mut app = PdfCraftApp::new();
+            app.dialog = Some(crate::Dialog::Print);
+            app.print_draft.printer = Some("OldPrinter".into());
+            app.print_draft.show_driver_options = true;
+            app.start_driver_options_with(
+                "OldPrinter".into(),
+                std::sync::Arc::new(|_, cancel| {
+                    let start = std::time::Instant::now();
+                    while !cancel.load(std::sync::atomic::Ordering::Relaxed) && start.elapsed() < std::time::Duration::from_secs(2) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+                    Ok(Vec::new()) // A late success is still stale.
+                }),
+            );
+            if close {
+                app.dialog = None;
+            } else {
+                app.print_draft.printer = Some("NewPrinter".into());
+            }
+            let start = std::time::Instant::now();
+            while app.print_tasks.options.is_some() && start.elapsed() < std::time::Duration::from_secs(2) {
+                app.poll_driver_options();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(app.print_tasks.options.is_none());
+            assert!(app.print_draft.driver_options.is_none());
+            assert!(!app.print_draft.driver_loading);
+        }
+    }
 
     #[test]
     fn current_page_preview_uses_positions_and_selection_guards() {

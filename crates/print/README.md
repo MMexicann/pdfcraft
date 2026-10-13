@@ -75,3 +75,13 @@ a matching page. On Windows craft-print sends the sheets as vectors with a Print
 for the sheet's exact paper and no scaling (#599's approach), validated by the driver:
 a job is refused, not shrunk, when the driver lacks the paper or would change it. Verify
 the driver's paper settings and physical calibration before relying on drawing scale.
+
+## Printer properties lookup
+
+CUPS options keep PdfCraft’s PPD parser and queue/instance defaults. The desktop dialog reads
+properties on a worker, shows a loading indicator and discards results after closing the
+dialog or switching printers. `spool::printer_options_checked` accepts a cancellation flag,
+kills and reaps its owned helper on cancellation or after five seconds, and limits helper
+output to 1 MiB. The `printer_options` automation tool reports lookup failures. Missing
+`lpoptions` retains PPD defaults; the compatibility Vec API returns no options on other errors.
+Physical printer output remains unverified by these synthetic process and UI tests.
