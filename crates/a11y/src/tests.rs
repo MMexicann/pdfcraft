@@ -736,3 +736,82 @@ fn a_nested_finding_says_itself() {
     // Both wordings are translated, each on its own, and the document's words are left alone.
     assert_eq!(f.said(&|w: &str| format!("«{w}»")), "«Table element on page 3: «rows have between 1 and 2 columns»»");
 }
+
+#[test]
+fn named_figure_properties_become_artifacts_without_dangling_parent_links() {
+    use pdfcraft_cos::{Dict, ObjRef, PdfString, SaveOptions, Stream, write_full};
+    for inherited in [false, true] {
+        let mut doc = figures_doc();
+        let mut property = Dict::new();
+        property.set(b"MCID".to_vec(), Object::Int(0));
+        property.set(b"PCPrivate".to_vec(), PdfString::text("keep property metadata"));
+        let property = doc.add(property);
+        let mut resources = doc.get(ObjRef::new(3, 0)).as_dict().unwrap().get(b"Resources").unwrap().as_dict().unwrap().clone();
+        let mut props = Dict::new();
+        props.set(b"FigureProps".to_vec(), Object::Ref(property));
+        resources.set(b"Properties".to_vec(), Object::Ref(doc.add(props)));
+        if inherited {
+            let struct_parents = doc.add(Object::Int(0));
+            doc.update_dict(ObjRef::new(3, 0), |d| d.set(b"StructParents".to_vec(), Object::Ref(struct_parents))).unwrap();
+            doc.update_dict(ObjRef::new(2, 0), |d| d.set(b"Resources".to_vec(), Object::Dict(resources))).unwrap();
+            doc.update_dict(ObjRef::new(3, 0), |d| {
+                d.remove(b"Resources");
+            })
+            .unwrap();
+        } else {
+            doc.update_dict(ObjRef::new(3, 0), |d| d.set(b"Resources".to_vec(), Object::Dict(resources))).unwrap();
+        }
+        let mut stream_meta = Dict::new();
+        stream_meta.set(b"PCMetadata".to_vec(), PdfString::text("keep stream metadata"));
+        doc.set(
+            ObjRef::new(4, 0),
+            Stream::flate(
+                stream_meta,
+                b"/Figure /FigureProps BDC q 40 0 0 20 10 150 cm /Im Do Q EMC /Photo << /MCID 1 >> BDC 100 100 50 30 re f EMC",
+            ),
+        );
+        let doc = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+        let figure = figures(&doc)[0].obj;
+        let mut doc = doc;
+        mark_decorative(&mut doc, figure).unwrap();
+        let doc = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+        let pages = pdfcraft_model::pages(&doc);
+        let contents = doc.resolve(pages[0].dict.get(b"Contents").unwrap());
+        let Object::Stream(contents) = &*contents else { panic!("one content stream") };
+        let text = String::from_utf8(contents.decoded().unwrap()).unwrap();
+        assert!(text.contains("/Artifact BMC"), "named figure must become an artifact: {text}");
+        assert!(!text.contains("/FigureProps BDC"));
+        assert!(text.contains("/MCID 1"), "unrelated figure remains tagged");
+        assert_eq!(contents.dict.get(b"PCMetadata").and_then(Object::as_string).unwrap().to_text(), "keep stream metadata");
+        let catalog = doc.get(doc.root().unwrap());
+        let tree = doc.resolve(catalog.as_dict().unwrap().get(b"StructTreeRoot").unwrap());
+        let pt = doc.resolve(tree.as_dict().unwrap().get(b"ParentTree").unwrap());
+        let nums = pt.as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap();
+        let associations = nums[1].as_array().unwrap();
+        assert_eq!(associations[0], Object::Null);
+        assert_eq!(figures(&doc).len(), 1);
+        assert_eq!(associations[1].as_ref(), Some(figures(&doc)[0].obj));
+    }
+}
+
+#[test]
+fn decorative_refusal_keeps_content_and_structure_when_a_mcid_is_missing() {
+    use pdfcraft_cos::{Dict, ObjRef, SaveOptions, Stream, write_full};
+    let mut doc = figures_doc();
+    doc.set(ObjRef::new(4, 0), Stream::flate(Dict::new(), b"/Figure /MissingProperty BDC 10 10 20 20 re f EMC"));
+    let before = write_full(&doc, &SaveOptions::default()).unwrap();
+    let figure = figures(&doc)[0].obj;
+    assert!(matches!(mark_decorative(&mut doc, figure), Err(AltError::Unsupported(_))));
+    assert_eq!(write_full(&doc, &SaveOptions::default()).unwrap(), before);
+}
+
+#[test]
+fn decorative_refusal_rolls_back_when_parent_tree_is_malformed() {
+    use pdfcraft_cos::{ObjRef, SaveOptions, write_full};
+    let mut doc = figures_doc();
+    doc.update_dict(ObjRef::new(9, 0), |d| d.set(b"Nums".to_vec(), Object::Array(vec![Object::Int(0)]))).unwrap();
+    let before = write_full(&doc, &SaveOptions::default()).unwrap();
+    let figure = figures(&doc)[0].obj;
+    assert!(matches!(mark_decorative(&mut doc, figure), Err(AltError::Unsupported(_))));
+    assert_eq!(write_full(&doc, &SaveOptions::default()).unwrap(), before, "content must not change before a refused tree edit");
+}

@@ -23,6 +23,8 @@ pub enum AltError {
     Untagged,
     #[error("object {0} is not a figure")]
     NotAFigure(u32),
+    #[error("the figure cannot be marked decorative: {0}")]
+    Unsupported(&'static str),
     #[error("{0}")]
     Cos(#[from] pdfcraft_cos::CosError),
 }
@@ -265,29 +267,87 @@ pub fn set_alt(doc: &mut Document, obj: ObjRef, alt: Option<&str>) -> Result<(),
 /// Decorative figure: its marked content on the page becomes an artifact, and the element
 /// leaves the structure tree (and the parent tree).
 pub fn mark_decorative(doc: &mut Document, obj: ObjRef) -> Result<(), AltError> {
+    // Work on a copy: a malformed/unsupported tag must leave both content and structure intact.
+    let mut next = doc.clone();
+    mark_decorative_inner(&mut next, obj)?;
+    *doc = next;
+    Ok(())
+}
+
+fn mark_decorative_inner(doc: &mut Document, obj: ObjRef) -> Result<(), AltError> {
     let d = check_figure(doc, obj)?;
     let ids: HashSet<i64> = mcids(&d).into_iter().collect();
     let pages = pdfcraft_model::pages(doc);
     let pg = d.get(b"Pg").and_then(Object::as_ref).or_else(|| elements(doc).into_iter().find(|e| e.object == obj).and_then(|e| e.page));
-    if let Some(page) = pg.and_then(|p| pages.iter().find(|x| x.obj == p)).filter(|_| !ids.is_empty()) {
-        let mut ops = pdfcraft_content::parse(&page_content(doc, &page.dict)).ops;
+    let page = pg.and_then(|p| pages.iter().find(|x| x.obj == p)).ok_or(AltError::Unsupported("its page is not available"))?;
+    if ids.is_empty() {
+        return Err(AltError::Unsupported("its marked-content identifiers are not available"));
+    }
+    let content = page.dict.get(b"Contents").ok_or(AltError::Unsupported("its page has no content"))?;
+    let entries = match &*doc.resolve(content) {
+        Object::Array(entries) => entries.clone(),
+        Object::Stream(_) => vec![content.clone()],
+        _ => return Err(AltError::Unsupported("its page content is not a stream")),
+    };
+    let properties = page.dict.get(b"Resources").and_then(|r| doc.dict(r)).and_then(|r| r.get(b"Properties").and_then(|p| doc.dict(p)));
+    let mut shared_content = HashSet::new();
+    for other in pages.iter().filter(|other| other.obj != page.obj) {
+        if let Some(content) = other.dict.get(b"Contents") {
+            match &*doc.resolve(content) {
+                Object::Array(entries) => shared_content.extend(entries.iter().filter_map(Object::as_ref)),
+                Object::Stream(_) => {
+                    if let Some(reference) = content.as_ref() {
+                        shared_content.insert(reference);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = HashSet::new();
+    let mut budget = 64 * 1024 * 1024usize;
+    for entry in entries {
+        let value = doc.resolve(&entry);
+        let Object::Stream(stream) = &*value else { return Err(AltError::Unsupported("its page content contains a non-stream")) };
+        let decoded = stream.decoded_within(budget)?;
+        budget = budget.checked_sub(decoded.len()).ok_or(AltError::Unsupported("its page content exceeds 64 MiB"))?;
+        let mut ops = pdfcraft_content::parse(&decoded).ops;
         let mut changed = false;
-        for op in ops.iter_mut() {
-            let ours = op.op == b"BDC"
-                && matches!(op.operands.get(1), Some(Object::Dict(m)) if m.get(b"MCID").and_then(Object::as_int).is_some_and(|n| ids.contains(&n)));
-            if ours {
+        for op in &mut ops {
+            if op.op != b"BDC" {
+                continue;
+            }
+            let dictionary = match op.operands.get(1) {
+                Some(Object::Name(name)) => properties.as_ref().and_then(|p| p.get(name)).and_then(|p| doc.dict(p)),
+                Some(Object::Dict(dictionary)) => Some(dictionary.clone()),
+                _ => None,
+            };
+            let mcid = dictionary.and_then(|d| d.get(b"MCID").map(|v| doc.resolve(v))).and_then(|v| v.as_int());
+            if let Some(mcid) = mcid.filter(|id| ids.contains(id)) {
+                found.insert(mcid);
                 *op = pdfcraft_content::Op::new("BMC", vec![Object::name("Artifact")]);
                 changed = true;
             }
         }
         if changed {
-            let s = doc.add(Object::Stream(Stream::flate(Dict::new(), &pdfcraft_content::serialize_ops(&ops))));
-            doc.update_dict(page.obj, |p| p.set(b"Contents".to_vec(), Object::Ref(s)))?;
-            // The parent tree no longer points those ids at the figure.
-            if let Some(key) = page.dict.get(b"StructParents").and_then(Object::as_int) {
-                clear_parent_tree(doc, key, obj)?;
+            // Keep each stream's identity, unknown metadata and the original contents array.
+            let mut dict = stream.dict.clone();
+            for key in [b"Length".as_slice(), b"Filter", b"DecodeParms"] {
+                dict.remove(key);
             }
+            let stream = Stream::flate(dict, &pdfcraft_content::serialize_ops(&ops));
+            let reference = entry.as_ref().ok_or(AltError::Unsupported("its content stream is not indirect"))?;
+            if shared_content.contains(&reference) {
+                return Err(AltError::Unsupported("its content stream is shared with another page"));
+            }
+            doc.set(reference, stream);
         }
+    }
+    if found != ids {
+        return Err(AltError::Unsupported("not all of its marked content is on the page"));
+    }
+    if let Some(key) = page.dict.get(b"StructParents").map(|key| doc.resolve(key)).and_then(|key| key.as_int()) {
+        clear_parent_tree(doc, key, obj)?;
     }
     // Out of its parent's kids.
     if let Some(parent) = d.get(b"P").and_then(Object::as_ref) {
@@ -308,10 +368,18 @@ pub fn mark_decorative(doc: &mut Document, obj: ObjRef) -> Result<(), AltError> 
 /// Replace `obj` by null in the page's parent-tree array (`key`), in a flat /Nums tree.
 fn clear_parent_tree(doc: &mut Document, key: i64, obj: ObjRef) -> Result<(), AltError> {
     let Some(pt) = tree_root(doc).and_then(|r| r.get(b"ParentTree").and_then(Object::as_ref)) else { return Ok(()) };
-    let Some(nums) = doc.get(pt).as_dict().and_then(|d| d.get(b"Nums").and_then(|n| n.as_array().cloned())) else { return Ok(()) };
+    let nums = doc
+        .get(pt)
+        .as_dict()
+        .and_then(|d| d.get(b"Nums").map(|n| doc.resolve(n)))
+        .and_then(|n| n.as_array().cloned())
+        .ok_or(AltError::Unsupported("its parent tree is not a flat number tree"))?;
+    if nums.len() % 2 != 0 {
+        return Err(AltError::Unsupported("its parent tree contains an unpaired key"));
+    }
     let mut nums = nums;
     for pair in nums.chunks_mut(2) {
-        if pair[0].as_int() == Some(key) {
+        if doc.resolve(&pair[0]).as_int() == Some(key) {
             match &pair[1] {
                 Object::Array(a) => {
                     pair[1] = Object::Array(a.iter().map(|x| if x.as_ref() == Some(obj) { Object::Null } else { x.clone() }).collect())
