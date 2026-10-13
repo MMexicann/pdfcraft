@@ -4899,6 +4899,37 @@ trailer << /Root 1 0 R >>
         assert_eq!(page.rgba.as_chunks::<4>().0.to_vec(), expected);
     }
 
+    /// Issue #1649: Word can save text as a tiny black image whose `/SMask` is a high-resolution
+    /// bitmap of the glyphs, so the mask alone carries the text. Shrinking that mask by
+    /// nearest-neighbour keeps one sample in N, and a stroke thinner than N mask pixels vanished:
+    /// the text came out broken and aliased. Here a one-column stroke of an 8-column mask is drawn
+    /// 4 pixels wide; nearest reads columns 1, 3, 5 and 7 and misses the stroke in column 2.
+    #[test]
+    fn shrunk_soft_mask_larger_than_its_image_keeps_thin_strokes() {
+        let mask: [u8; 8] = [0, 0, 255, 0, 0, 0, 0, 0];
+        let content = "q 4 0 0 1 0 0 cm /Im0 Do Q";
+        let pdf = format!(
+            "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+             2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+             3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 4 1] /Contents 4 0 R /Resources << /XObject << /Im0 5 0 R >> >> >> endobj\n\
+             4 0 obj << /Length {} >> stream\n{content}\nendstream endobj\n\
+             5 0 obj << /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 6 0 R /Filter /ASCIIHexDecode /Length 3 >> stream\n00>\nendstream endobj\n\
+             6 0 obj << /Type /XObject /Subtype /Image /Width 8 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /ASCIIHexDecode /Length {} >> stream\n{}>\nendstream endobj\n\
+             trailer << /Root 1 0 R >>\n%%EOF\n",
+            content.len(),
+            hex(&mask).len() + 1,
+            hex(&mask)
+        );
+        let mut renderer = PageRenderer::new(Arc::new(pdf.into_bytes()), RenderConfig::default());
+        let page = renderer.render(RenderRequest { page: 0, kind: RequestKind::Pixels, scale: 1.0, ..Default::default() });
+        assert!(page.error.is_none(), "{:?}", page.error);
+        assert_eq!((page.width, page.height), (4, 1));
+        let grays: Vec<u8> = page.rgba.as_chunks::<4>().0.iter().map(|px| px[0]).collect();
+        // The stroke covers half of device pixel 1, so it is a mid-tone; the far side stays white.
+        assert!((64..=191).contains(&grays[1]), "the stroke is lost or not a mid-tone: {grays:?}");
+        assert_eq!(grays[3], 255, "{grays:?}");
+    }
+
     /// Type 3 glyph images used to be sampled bicubically (`ImageQuality::High`) whatever their
     /// `/Interpolate`, which blends the nearest pre-resize back in. The glyph is 4.6 × 2.3 pixels
     /// and its image pre-resizes to 5 × 3, so the final draw samples fractionally and bicubic
@@ -5955,6 +5986,48 @@ trailer << /Root 1 0 R >>
         ] {
             let p = render(content);
             assert!([(5, 5), (50, 50), (95, 95)].iter().all(|(x, y)| px(&p, *x, *y) == red), "{content}: no stray clip");
+        }
+    }
+
+    /// ISO 32000-1 §9.3.6: only text rendering mode 3 has any effect on a Type 3 font (vendored
+    /// hayro-interpret patch in `show_glyph`). Print-stream PDFs set `2 Tr` for Type 3 bitmap
+    /// fonts, and the glyph procedure ran twice (fill, then stroke), so its anti-aliased edges
+    /// doubled up and the text looked bold; under `1 Tr` an uncoloured glyph took the stroking
+    /// colour, and under `7 Tr` it disappeared. Both glyph kinds have edges between pixels.
+    #[test]
+    fn text_rendering_modes_other_than_invisible_draw_type3_glyphs_as_filled() {
+        let render = |glyph: &str, mode: u8| {
+            let content = format!("BT 1 0 0 RG 6 w 0 g /F1 20 Tf {mode} Tr 10.3 10.3 Td (A) Tj ET");
+            let pdf = format!(
+                "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj
+4 0 obj << /Length {} >> stream
+{content}
+endstream endobj
+5 0 obj << /Type /Font /Subtype /Type3 /FontBBox [0 0 1 1] /FontMatrix [1 0 0 1 0 0] /FirstChar 65 /LastChar 65 /Widths [1]
+  /Encoding << /Differences [65 /a] >> /CharProcs << /a 6 0 R >> >> endobj
+6 0 obj << /Length {} >> stream
+{glyph}
+endstream endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+                content.len(),
+                glyph.len()
+            );
+            let mut r = PageRenderer::new(Arc::new(pdf.into_bytes()), RenderConfig::default());
+            let p = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0, ..Default::default() });
+            assert!(p.error.is_none(), "{glyph} {mode} Tr: {:?}", p.error);
+            p.rgba
+        };
+        for glyph in ["1 0 0 0 1 1 d1 0.12 0.12 0.71 0.71 re f", "1 0 d0 0.12 0.12 0.71 0.71 re f"] {
+            let filled = render(glyph, 0);
+            assert!(filled.as_chunks::<4>().0.iter().any(|p| p[0] < 128), "{glyph}: the glyph paints");
+            for mode in [1, 2, 4, 5, 6, 7] {
+                assert!(render(glyph, mode) == filled, "{glyph}: {mode} Tr draws as 0 Tr");
+            }
+            assert!(render(glyph, 3).as_chunks::<4>().0.iter().all(|p| p[..3] == [255, 255, 255]), "{glyph}: 3 Tr hides the glyph");
         }
     }
 }
