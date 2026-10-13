@@ -17,7 +17,7 @@
 //! - layers (optional content groups) used by the pages are registered in the destination's
 //!   `/OCProperties`, keeping their default on/off state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object};
 
@@ -282,6 +282,14 @@ fn import_pages_mapped(
             (*page, new, inherited.clone())
         })
         .collect();
+    let mut seen_pages = HashSet::new();
+    let mut repeated_pages = HashSet::new();
+    for page in src_pages.iter().filter_map(|i| source.get(*i).map(|p| p.0)) {
+        if !seen_pages.insert(page) {
+            repeated_pages.insert(page);
+        }
+    }
+    let mut combined_fields: HashMap<(ObjRef, usize), ObjRef> = HashMap::new();
     let mut annot_pages = HashMap::new();
     let mut new_pages = Vec::new();
     let mut done: HashMap<ObjRef, ObjRef> = HashMap::new();
@@ -309,7 +317,7 @@ fn import_pages_mapped(
             if k.as_slice() == b"Annots" {
                 let list = src.resolve(v).as_array().cloned().unwrap_or_default();
                 let mut out = Vec::new();
-                for a in list {
+                for (annotation_index, a) in list.into_iter().enumerate() {
                     // On a repeated page a form field's widget becomes one more widget of the
                     // same field (copied already with the page's first copy): one field, one
                     // value, shown on both pages. Copying the field again would make two fields
@@ -341,10 +349,91 @@ fn import_pages_mapped(
                         out.push(Object::Ref(r));
                         continue;
                     }
-                    // A widget that is its own field (no parent to hang a second widget on) stays
-                    // the one object, shown on both pages, so the field stays one.
-                    let own_field = resolved.as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Widget") && !d.contains(b"Parent"));
-                    let annots = if own_field { &mut copier } else { own.as_mut().unwrap_or(&mut copier) };
+                    // A combined field/widget needs a shared field and a distinct widget on
+                    // every copy. Split it before copying any widget, so actions referring to
+                    // the source field map to the shared field rather than a page annotation.
+                    let combined = resolved.as_dict().filter(|d| d.name(b"Subtype") == Some(b"Widget") && !d.contains(b"Parent"));
+                    if repeated_pages.contains(&page)
+                        && let Some(combined) = combined
+                    {
+                        let key = (page, annotation_index);
+                        let parent = if let Some(parent) = combined_fields.get(&key) {
+                            *parent
+                        } else {
+                            let parent = a.as_ref().and_then(|source| copier.map.get(&source).copied()).unwrap_or_else(|| dst.add(Object::Null));
+                            if let Some(source) = a.as_ref() {
+                                copier.map.insert(source, parent);
+                            }
+                            let mut field = combined.clone();
+                            for key in [
+                                b"Type".as_slice(),
+                                b"Subtype",
+                                b"Rect",
+                                b"P",
+                                b"AP",
+                                b"AS",
+                                b"A",
+                                b"MK",
+                                b"C",
+                                b"BS",
+                                b"Border",
+                                b"F",
+                                b"H",
+                                b"Contents",
+                                b"NM",
+                                b"M",
+                                b"Popup",
+                                b"OC",
+                                b"StructParent",
+                            ] {
+                                field.remove(key);
+                            }
+                            split_widget_actions(src, &mut field, true);
+                            let copied = copier.copy_value(dst, &Object::Dict(field), Some(parent));
+                            dst.set(parent, copied);
+                            copier.annots.retain(|r| *r != parent);
+                            dst.update_dict(parent, |field| field.set(b"Kids".to_vec(), Object::Array(Vec::new())))?;
+                            combined_fields.insert(key, parent);
+                            parent
+                        };
+                        let mut widget = combined.clone();
+                        for key in [
+                            b"FT".as_slice(),
+                            b"T",
+                            b"TU",
+                            b"TM",
+                            b"Ff",
+                            b"V",
+                            b"DV",
+                            b"DA",
+                            b"Q",
+                            b"Opt",
+                            b"MaxLen",
+                            b"TI",
+                            b"I",
+                            b"RV",
+                            b"DS",
+                            b"DR",
+                            b"Lock",
+                            b"SV",
+                        ] {
+                            widget.remove(key);
+                        }
+                        split_widget_actions(src, &mut widget, false);
+                        let r = dst.add(Object::Null);
+                        let copied = copier.copy_value(dst, &Object::Dict(widget), Some(r));
+                        dst.set(r, copied);
+                        dst.update_dict(r, |widget| widget.set(b"Parent".to_vec(), Object::Ref(parent)))?;
+                        dst.update_dict(parent, |field| {
+                            let mut kids = field.get(b"Kids").and_then(Object::as_array).cloned().unwrap_or_default();
+                            kids.push(Object::Ref(r));
+                            field.set(b"Kids".to_vec(), Object::Array(kids));
+                        })?;
+                        annot_pages.insert(r, new);
+                        out.push(Object::Ref(r));
+                        continue;
+                    }
+                    let annots = own.as_mut().unwrap_or(&mut copier);
                     // Direct (inline) annotation dictionaries become indirect objects, so every
                     // copied annotation can be fixed up the same way.
                     let r = match a {
@@ -401,6 +490,24 @@ fn import_pages_mapped(
     existing.splice(at..at, inserted);
     rebuild(dst, &existing)?;
     Ok(Imported { pages: new_pages, page_map: copier.pages, objects: copier.map, renamed_fields })
+}
+
+// Field calculation/validation actions belong on the field; widget mouse/focus actions
+// belong on each annotation. Unknown entries are retained in both dictionaries.
+fn split_widget_actions(src: &Document, dictionary: &mut Dict, field: bool) {
+    let Some(actions) = dictionary.get(b"AA").and_then(|actions| src.dict(actions)) else { return };
+    let field_keys: &[&[u8]] = &[b"K", b"F", b"V", b"C"];
+    let widget_keys: &[&[u8]] = &[b"E", b"X", b"D", b"U", b"Fo", b"Bl", b"PO", b"PC", b"PV", b"PI"];
+    let actions: Dict = actions
+        .iter()
+        .filter(|(key, _)| if field { !widget_keys.contains(&key.as_slice()) } else { !field_keys.contains(&key.as_slice()) })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if actions.is_empty() {
+        dictionary.remove(b"AA");
+    } else {
+        dictionary.set(b"AA".to_vec(), Object::Dict(actions));
+    }
 }
 
 /// A page's `/Resources` with the names that only its page-tree ancestors list, or `None` when

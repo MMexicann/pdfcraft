@@ -622,11 +622,6 @@ fn links_are_rewired_to_copied_pages_or_dropped() {
     assert!(!link.contains(b"Dest") && !link.contains(b"A"));
 }
 
-/// A widget annotation that is its own form field (no `/Parent`).
-fn own_field(doc: &Document, r: ObjRef) -> bool {
-    doc.get(r).as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Widget") && !d.contains(b"Parent"))
-}
-
 #[test]
 fn repeated_page_gets_independent_annotations() {
     // A1 has a link, A2 a link and a form field, A3 a note with a popup; each is listed twice.
@@ -640,15 +635,11 @@ fn repeated_page_gets_independent_annotations() {
         assert!(!refs[i].is_empty());
         assert_eq!(refs[i].len(), refs[i + 1].len());
         for (a, b) in refs[i].iter().zip(&refs[i + 1]) {
-            // A widget that is its own field stays one object on both pages, so the field stays
-            // one (#790); every other annotation is copied.
-            if !own_field(&out, *a) {
-                assert_ne!(a, b, "each copy of the page has its own annotation objects");
-            }
+            assert_ne!(a, b, "each copy of the page has its own annotation objects");
         }
     }
     for (i, list) in refs.iter().enumerate() {
-        for a in list.iter().filter(|a| !own_field(&out, **a)) {
+        for a in list {
             assert_eq!(out.get(*a).as_dict().unwrap().reference(b"P"), Some(ps[i].obj), "/P names the page holding the copy");
         }
     }
@@ -2391,7 +2382,9 @@ fn a_repeated_page_joins_the_renamed_field() {
     let renamed = fields[1].clone();
     for page in [1, 2] {
         let list = page_dict(&dst, page).get(b"Annots").map(|a| dst.resolve(a)).and_then(|a| a.as_array().cloned()).unwrap();
-        assert!(list.contains(&renamed), "page {page}'s widget belongs to the renamed field");
+        let widgets: Vec<_> = list.iter().filter(|r| dst.resolve(r).as_dict().and_then(|d| d.reference(b"Parent")) == renamed.as_ref()).collect();
+        assert_eq!(widgets.len(), 1, "page {page}'s widget belongs to the renamed field");
+        assert_ne!(widgets[0], &renamed, "the field itself is not a page annotation");
     }
 }
 
@@ -2440,4 +2433,79 @@ fn combine_field_conflicts_previews_each_file_in_order() {
     assert_eq!(preview[0], [], "the first file collides with nothing");
     assert_eq!(preview[1], [("Text1".to_string(), "Text1-1".to_string())]);
     assert_eq!(preview[2], [("Text1".to_string(), "Text1-2".to_string())], "the cascade continues past the earlier rename");
+}
+
+#[test]
+fn repeated_combined_widgets_share_the_field_value_but_not_placement() {
+    let mut src = doc_a();
+    let source_page = pages(&src).unwrap()[1].obj;
+    let source_widget = src
+        .get(source_page)
+        .as_dict()
+        .unwrap()
+        .get(b"Annots")
+        .map(|a| src.resolve(a))
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|a| src.resolve(a).as_dict().filter(|d| d.name(b"Subtype") == Some(b"Widget")).and(a.as_ref()))
+        .unwrap();
+    let mut actions = Dict::new();
+    let action = |script: &str| {
+        let mut d = Dict::new();
+        d.set(b"S".to_vec(), Object::name("JavaScript"));
+        d.set(b"JS".to_vec(), pdfcraft_cos::PdfString::text(script));
+        Object::Dict(d)
+    };
+    actions.set(b"K".to_vec(), action("event.rc = true;"));
+    actions.set(b"U".to_vec(), action("this.dirty = true;"));
+    let actions = src.add(actions);
+    src.update_dict(source_widget, |d| {
+        d.set(b"V".to_vec(), pdfcraft_cos::PdfString::text("one shared value"));
+        d.set(b"AA".to_vec(), Object::Ref(actions));
+        d.set(b"PCMetadata".to_vec(), pdfcraft_cos::PdfString::text("keep unknown data"));
+    })
+    .unwrap();
+    let mut out = full_roundtrip(&extract_pages(&src, &[1, 1, 1]).unwrap());
+    let ps = pages(&out).unwrap();
+    let widgets: Vec<ObjRef> = ps
+        .iter()
+        .map(|p| {
+            out.get(p.obj)
+                .as_dict()
+                .unwrap()
+                .get(b"Annots")
+                .map(|a| out.resolve(a))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find_map(|a| out.resolve(a).as_dict().filter(|d| d.name(b"Subtype") == Some(b"Widget")).and(a.as_ref()))
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(widgets.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+    let parent = out.get(widgets[0]).as_dict().unwrap().reference(b"Parent").unwrap();
+    let field = out.get(parent);
+    let field = field.as_dict().unwrap();
+    assert!(!field.contains(b"Subtype") && !field.contains(b"Rect"));
+    assert_eq!(field.get(b"V").and_then(Object::as_string).unwrap().to_text(), "one shared value");
+    assert_eq!(field.get(b"Kids").and_then(Object::as_array).unwrap(), &widgets.iter().map(|r| Object::Ref(*r)).collect::<Vec<_>>());
+    let field_actions = out.resolve(field.get(b"AA").unwrap());
+    assert!(field_actions.as_dict().unwrap().contains(b"K") && !field_actions.as_dict().unwrap().contains(b"U"));
+    for (index, widget) in widgets.iter().enumerate() {
+        let value = out.get(*widget);
+        let d = value.as_dict().unwrap();
+        assert_eq!(d.reference(b"Parent"), Some(parent));
+        assert_eq!(d.reference(b"P"), Some(ps[index].obj));
+        assert!(!d.contains(b"FT") && !d.contains(b"V"));
+        assert_eq!(d.get(b"PCMetadata").and_then(Object::as_string).unwrap().to_text(), "keep unknown data");
+        let actions = out.resolve(d.get(b"AA").unwrap());
+        assert!(actions.as_dict().unwrap().contains(b"U") && !actions.as_dict().unwrap().contains(b"K"));
+    }
+    let second_rect = out.get(widgets[1]).as_dict().unwrap().get(b"Rect").unwrap().clone();
+    out.update_dict(widgets[0], |d| d.set(b"Rect".to_vec(), Object::Array(vec![1.into(), 2.into(), 3.into(), 4.into()]))).unwrap();
+    let out = full_roundtrip(&out);
+    assert_eq!(out.get(widgets[1]).as_dict().unwrap().get(b"Rect"), Some(&second_rect));
 }

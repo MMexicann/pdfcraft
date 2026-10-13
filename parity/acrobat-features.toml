@@ -2752,8 +2752,8 @@ milestone = "M4"
 status = "shipped"
 commands = ["page.extract"]
 tools = ["page_extract"]
-evidence = ["crates/ui-egui/tests/editing.rs::extract_button_copies_selected_pages_to_a_new_tab", "crates/automation/tests/automation.rs::combine_extract_and_split", "crates/organize/src/tests.rs::extract_and_split_keep_the_pdfx_output_intent_and_identification"]
-notes = "Carries the PDF/X output intent and identification (#263) in a new XMP packet; the source XMP (dates, other schemas) is not copied."
+evidence = ["crates/organize/src/tests.rs::repeated_combined_widgets_share_the_field_value_but_not_placement", "crates/ui-egui/tests/editing.rs::extract_button_copies_selected_pages_to_a_new_tab", "crates/automation/tests/automation.rs::combine_extract_and_split", "crates/organize/src/tests.rs::extract_and_split_keep_the_pdfx_output_intent_and_identification"]
+notes = "Carries the PDF/X output intent and identification (#263) in a new XMP packet; the source XMP (dates, other schemas) is not copied. Repeated source pages retain one field value but have separate widgets with correct page references; saved/reopened placement and additional actions are tested."
 
 [[feature]]
 id = "organize.extract-separate-files"
