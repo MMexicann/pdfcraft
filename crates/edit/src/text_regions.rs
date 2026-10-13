@@ -105,7 +105,9 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
                 && aligned
                 && first.size.min(prev.size) >= first.size.max(prev.size) * 0.4
                 && gap > first.size.min(prev.size) * 0.8
-                && gap < first.size.max(prev.size) * 2.5
+                // Reading/export paragraphs must not absorb a blank line (e.g. two 14 pt
+                // advances at 12 pt). The editor may still select a larger mixed-style region.
+                && gap < first.size.max(prev.size) * if mixed { 2.5 } else { 1.8 }
         });
         if !joins {
             blocks.push(TextBlock {

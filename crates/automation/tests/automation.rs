@@ -4408,6 +4408,41 @@ fn exporting_to_word_html_and_rtf() {
     assert!(a.call("doc_export_office", &json!({ "doc": doc, "path": "a.xyz" })).is_err());
 }
 
+/// #1973: blank lines in PDF text delimit actual paragraphs in the emitted Word package.
+#[test]
+fn exporting_to_word_preserves_blank_line_paragraphs() {
+    use pdfcraft_cos::{Dict, Document, ObjRef, SaveOptions, Stream, write_full};
+    let dir = workdir("word-paragraphs");
+    let mut pdf = Document::open(std::sync::Arc::new(fixture(1))).unwrap();
+    let body = b"BT /F1 12 Tf 20 250 Td (First paragraph) Tj 0 -14 Td (wrapped line) Tj 0 -28 Td (Second paragraph) Tj 0 -18 Td (widely spaced wrapped line) Tj 0 -28 Td (Closing paragraph) Tj ET";
+    pdf.set(ObjRef::new(5, 0), Stream::flate(Dict::new(), body));
+    let input = write_full(&pdf, &SaveOptions::default()).unwrap();
+    std::fs::write(dir.join("paragraphs.pdf"), &input).unwrap();
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({ "path": "paragraphs.pdf" }))["doc"].as_u64().unwrap();
+    ok(&mut a, "doc_export_office", json!({ "doc": doc, "path": "paragraphs.docx" }));
+    let zip = std::fs::read(dir.join("paragraphs.docx")).unwrap();
+    let mut at = 0;
+    let mut xml = String::new();
+    while zip[at..].starts_with(b"PK\x03\x04") {
+        let size = u32::from_le_bytes(zip[at + 18..at + 22].try_into().unwrap()) as usize;
+        let len = u16::from_le_bytes(zip[at + 26..at + 28].try_into().unwrap()) as usize;
+        let data = at + 30 + len;
+        if &zip[at + 30..data] == b"word/document.xml" {
+            std::io::Read::read_to_string(&mut flate2::read::DeflateDecoder::new(&zip[data..data + size]), &mut xml).unwrap();
+            break;
+        }
+        at = data + size;
+    }
+    let paragraphs: Vec<&str> =
+        xml.split("<w:p>").skip(1).filter_map(|p| p.split_once("</w:p>").map(|(p, _)| p)).filter(|p| p.contains("<w:t")).collect();
+    assert_eq!(paragraphs.len(), 3, "{xml}");
+    assert!(paragraphs[0].contains("First paragraph wrapped line"));
+    assert!(paragraphs[1].contains("Second paragraph widely spaced wrapped line"));
+    assert!(paragraphs[2].contains("Closing paragraph"));
+    assert_eq!(std::fs::read(dir.join("paragraphs.pdf")).unwrap(), input);
+}
+
 /// #773: a diagonal watermark must not enter the body flow or move invoice fields.
 #[test]
 fn exporting_an_invoice_to_word_keeps_the_watermark_out_of_flow() {

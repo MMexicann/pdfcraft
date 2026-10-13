@@ -3443,3 +3443,15 @@ fn an_items_measured_face_is_the_face_it_is_written_as() {
     let courier = |italic| Family::Courier.width("Anna", 12.0, false, italic);
     assert_eq!(courier(false), courier(true));
 }
+
+#[test]
+fn office_reading_blocks_split_blank_line_gaps_but_keep_wrapped_lines() {
+    let mut doc = fixture();
+    let p = pdfcraft_cos::ObjRef::new(3, 0);
+    let content = doc.add(Stream::flate(Dict::new(), b"BT /F1 12 Tf 1 0 0 1 72 600 Tm (First paragraph line one) Tj 0 -14 Td (wrapped line two) Tj 0 -28 Td (Second paragraph line one) Tj 0 -14 Td (wrapped line two) Tj 0 -28 Td (Closing paragraph) Tj ET"));
+    doc.update_dict(p, |d| d.set(b"Contents".to_vec(), Object::Ref(content))).unwrap();
+    let doc = reopen(&doc);
+    let blocks = reading_blocks(&doc, 0).unwrap();
+    let texts: Vec<&str> = blocks.iter().map(|b| b.text.as_str()).collect();
+    assert_eq!(texts, ["First paragraph line one wrapped line two", "Second paragraph line one wrapped line two", "Closing paragraph"]);
+}
