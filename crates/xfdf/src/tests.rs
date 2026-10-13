@@ -167,7 +167,7 @@ fn xfdf_round_trips_comments_and_values() {
 #[test]
 fn fdf_round_trips_values_and_comments() {
     let src = filled();
-    let fdf = export_fdf(&src, true, true, "form.pdf");
+    let fdf = export_fdf(&src, true, true, "form.pdf").unwrap();
     assert!(fdf.starts_with(b"%FDF-1.2"));
     let mut dst = blank();
     let r = import(&mut dst, &fdf).unwrap();
@@ -209,7 +209,7 @@ fn non_utf8_check_box_states_round_trip() {
     let mut src = shift_jis_check_box();
     set_value(&mut src, "agree", &FieldValue::Check(true)).unwrap();
     // FDF writes the state's own bytes, not its #XX text.
-    let fdf = export_fdf(&src, false, true, "form.pdf");
+    let fdf = export_fdf(&src, false, true, "form.pdf").unwrap();
     let name: &[u8] = b"/#82#CD#82#A2";
     assert!(fdf.windows(name.len()).any(|w| w == name), "{}", String::from_utf8_lossy(&fdf));
     for data in [fdf, export_xfdf(&src, false, true, "form.pdf").into_bytes()] {
@@ -245,7 +245,7 @@ fn fdf_keeps_replies_and_review_status_on_their_note() {
     let want = threads(&src);
     assert_eq!(want.iter().filter(|t| t.1.as_deref() == Some("note")).count(), 3, "{want:?}");
 
-    let fdf = export_fdf(&src, true, false, "notes.pdf");
+    let fdf = export_fdf(&src, true, false, "notes.pdf").unwrap();
     // Every cross-reference entry points at its object (other readers trust the table).
     let tail = std::str::from_utf8(&fdf[fdf.windows(5).position(|w| w == b"xref\n").unwrap()..]).unwrap();
     let xref: usize = tail.lines().skip_while(|l| *l != "startxref").nth(1).unwrap().parse().unwrap();
@@ -415,7 +415,7 @@ fn bad_data_is_refused_with_a_reason() {
 fn data_files_merge_into_a_spreadsheet() {
     let src = filled();
     let xfdf = export_xfdf(&src, false, true, "form.pdf");
-    let fdf = export_fdf(&src, false, true, "form.pdf");
+    let fdf = export_fdf(&src, false, true, "form.pdf").unwrap();
     let mut other = blank();
     set_value(&mut other, "Name", &FieldValue::Text("Grace \"Amazing\" Hopper, RADM".into())).unwrap();
     let pdf = pdfcraft_cos::write_full(&other, &Default::default()).unwrap();
@@ -485,7 +485,7 @@ fn replacing_a_note_keeps_existing_replies_and_review_status() {
     )
     .unwrap();
     let original = Arc::new(write_full(&original, &SaveOptions::default()).unwrap());
-    for data in [xfdf.as_bytes().to_vec(), export_fdf(&incoming, true, false, "notes.pdf")] {
+    for data in [xfdf.as_bytes().to_vec(), export_fdf(&incoming, true, false, "notes.pdf").unwrap()] {
         // Start with the parent, reply and review status in the existing PDF revision.
         let mut doc = Document::open(original.clone()).unwrap();
         let mut want = threads(&doc);
@@ -508,7 +508,7 @@ fn replacing_a_note_keeps_existing_replies_and_review_status() {
             let reopened = Document::open(Arc::new(saved)).unwrap();
             let note = summaries(&reopened).into_iter().find(|s| s.name.as_deref() == Some("n1")).unwrap();
             assert_eq!(note.contents.as_deref(), Some("Updated note"));
-            let fdf = export_fdf(&reopened, true, false, "notes.pdf");
+            let fdf = export_fdf(&reopened, true, false, "notes.pdf").unwrap();
             let mut dst = blank();
             import(&mut dst, &fdf).unwrap();
             let mut got = threads(&dst);
@@ -552,7 +552,7 @@ fn replacing_an_indirectly_named_note_preserves_its_identity_and_thread() {
     let original = Arc::new(write_full(&original, &SaveOptions::default()).unwrap());
     let mut incoming = blank();
     import(&mut incoming, update).unwrap();
-    for data in [update.to_vec(), export_fdf(&incoming, true, false, "notes.pdf")] {
+    for data in [update.to_vec(), export_fdf(&incoming, true, false, "notes.pdf").unwrap()] {
         let mut doc = Document::open(original.clone()).unwrap();
         let refs = annotation_refs(&doc);
         assert_eq!(refs.len(), 3);
@@ -615,7 +615,7 @@ fn the_last_same_named_record_controls_its_reply_parent() {
         refs.push(incoming.add(d));
     }
     incoming.update_dict(page, |p| p.set(b"Annots".to_vec(), Object::Array(refs.into_iter().map(Object::Ref).collect()))).unwrap();
-    for data in [export_xfdf(&incoming, true, false, "notes.pdf").into_bytes(), export_fdf(&incoming, true, false, "notes.pdf")] {
+    for data in [export_xfdf(&incoming, true, false, "notes.pdf").into_bytes(), export_fdf(&incoming, true, false, "notes.pdf").unwrap()] {
         let mut doc = blank();
         import(&mut doc, &data).unwrap();
         let notes = summaries(&doc);
@@ -886,4 +886,151 @@ fn duplicate_xfdf_annotation_flags_do_not_turn_on_unrelated_bits() {
         let square = annotations.iter().filter_map(|a| doc.resolve(a).as_dict().cloned()).find(|d| d.name(b"Subtype") == Some(b"Square")).unwrap();
         assert_eq!(square.get(b"F").and_then(Object::as_int), Some(expected), "flags={flags}");
     }
+}
+
+#[test]
+fn fdf_export_keeps_indirect_values_nested_in_annotation_properties() {
+    let mut src = blank();
+    let page = pdfcraft_model::pages(&src)[0].obj;
+    let mut annotation = Dict::new();
+    annotation.set(b"Type".to_vec(), Object::name("Annot"));
+    annotation.set(b"Subtype".to_vec(), Object::name("Square"));
+    annotation.set(b"NM".to_vec(), PdfString::text("indirect-values"));
+    let rect = [50.0, 60.0, 100.0, 120.0].map(|v| Object::Ref(src.add(Object::Real(v))));
+    annotation.set(b"Rect".to_vec(), Object::Array(rect.into()));
+    let color = [0.25, 0.5, 0.75].map(|v| Object::Ref(src.add(Object::Real(v))));
+    annotation.set(b"C".to_vec(), Object::Array(color.into()));
+    let mut border = Dict::new();
+    border.set(b"W".to_vec(), Object::Ref(src.add(Object::Real(2.5))));
+    border.set(b"S".to_vec(), Object::name("D"));
+    let dash = [3.0, 2.0].map(|v| Object::Ref(src.add(Object::Real(v))));
+    border.set(b"D".to_vec(), Object::Ref(src.add(Object::Array(dash.into()))));
+    annotation.set(b"BS".to_vec(), Object::Ref(src.add(border)));
+    let note = src.add(annotation);
+    src.update_dict(page, |p| p.set(b"Annots".to_vec(), Object::Array(vec![Object::Ref(note)]))).unwrap();
+
+    // This is an actual saved PDF: indirect scalar numbers, arrays and dictionaries are legal
+    // PDF objects, and source object numbers have no meaning in an exported FDF.
+    let src = Document::open(Arc::new(write_full(&src, &SaveOptions::default()).unwrap())).unwrap();
+    assert_eq!(summaries(&src)[0].rect, [50.0, 60.0, 100.0, 120.0]);
+    assert_eq!(summaries(&src)[0].color, Some([0.25, 0.5, 0.75]));
+    let fdf = export_fdf(&src, true, false, "source.pdf").unwrap();
+    let exported = Document::open(Arc::new(fdf.clone())).unwrap();
+    let body = fdf_body(&exported).unwrap();
+    let annots = exported.resolve(body.get(b"Annots").unwrap());
+    let note = exported.resolve(&annots.as_array().unwrap()[0]);
+    let d = note.as_dict().unwrap();
+    assert_eq!(nums_of(&exported, d.get(b"Rect")), [50.0, 60.0, 100.0, 120.0], "{}", String::from_utf8_lossy(&fdf));
+    assert_eq!(nums_of(&exported, d.get(b"C")), [0.25, 0.5, 0.75]);
+    let bs = exported.resolve(d.get(b"BS").unwrap());
+    let bs = bs.as_dict().unwrap();
+    assert_eq!(exported.resolve(bs.get(b"W").unwrap()).as_f64(), Some(2.5));
+    assert_eq!(nums_of(&exported, bs.get(b"D")), [3.0, 2.0]);
+
+    let mut dst = blank();
+    import(&mut dst, &fdf).unwrap();
+    let dst = Document::open(Arc::new(write_full(&dst, &SaveOptions::default()).unwrap())).unwrap();
+    let notes = summaries(&dst);
+    assert_eq!(notes[0].rect, [50.0, 60.0, 100.0, 120.0]);
+    assert_eq!(notes[0].color, Some([0.25, 0.5, 0.75]));
+}
+
+/// Put extension data on a real exported comment without changing its normal properties.
+fn fdf_note_with_data(doc: &mut Document, data: Object) {
+    let page = pdfcraft_model::pages(doc)[0].obj;
+    let mut note = Dict::new();
+    note.set(b"Type".to_vec(), Object::name("Annot"));
+    note.set(b"Subtype".to_vec(), Object::name("Square"));
+    note.set(b"Rect".to_vec(), Object::Array(vec![10.into(), 20.into(), 30.into(), 40.into()]));
+    note.set(b"PCData".to_vec(), data);
+    let note = doc.add(note);
+    doc.update_dict(page, |dict| dict.set(b"Annots".to_vec(), Object::Array(vec![Object::Ref(note)]))).unwrap();
+}
+
+fn exported_note_data(doc: &Document) -> Object {
+    let body = fdf_body(doc).unwrap();
+    let annots = doc.resolve(body.get(b"Annots").unwrap());
+    let note = doc.resolve(&annots.as_array().unwrap()[0]);
+    note.as_dict().unwrap().get(b"PCData").unwrap().clone()
+}
+
+#[test]
+fn fdf_export_preserves_shared_cycles_and_nested_streams_without_expansion() {
+    let mut src = blank();
+    let leaf = src.add(PdfString::text("shared"));
+    let mut shared = leaf;
+    for _ in 0..35 {
+        shared = src.add(Object::Array(vec![Object::Ref(shared), Object::Ref(shared)]));
+    }
+    let cycle = src.add(Object::Null);
+    src.set(cycle, Object::Array(vec![Object::Ref(cycle)]));
+    let mut stream_dict = Dict::new();
+    stream_dict.set(b"PCMeta".to_vec(), Object::Ref(leaf));
+    let stream = src.add(pdfcraft_cos::Stream::from_raw(stream_dict, b"original bytes".to_vec()));
+    let data = Object::Array(vec![Object::Ref(shared), Object::Ref(shared), Object::Ref(cycle), Object::Ref(stream)]);
+    fdf_note_with_data(&mut src, data);
+    let src = Document::open(Arc::new(write_full(&src, &SaveOptions::default()).unwrap())).unwrap();
+    let bytes = export_fdf(&src, true, false, "source.pdf").unwrap();
+    assert!(bytes.len() < 10_000, "a shared graph must not expand");
+    let fdf = Document::open(Arc::new(bytes)).unwrap();
+    let data = exported_note_data(&fdf);
+    let data = data.as_array().unwrap();
+    assert_eq!(data[0], data[1]);
+    let mut current = data[0].clone();
+    for _ in 0..35 {
+        let next = fdf.resolve(&current);
+        let values = next.as_array().unwrap();
+        assert_eq!(values[0], values[1]);
+        current = values[0].clone();
+    }
+    assert_eq!(fdf.resolve(&current).as_string().unwrap().to_text(), "shared");
+    let cycle = fdf.resolve(&data[2]);
+    assert_eq!(cycle.as_array().unwrap()[0], data[2]);
+    let stream = fdf.resolve(&data[3]);
+    let Object::Stream(stream) = &*stream else { panic!("copied stream") };
+    assert_eq!(&*stream.raw, b"original bytes");
+    assert_eq!(fdf.resolve(stream.dict.get(b"PCMeta").unwrap()).as_string().unwrap().to_text(), "shared");
+}
+
+#[test]
+fn fdf_export_walks_long_indirect_chains_and_nulls_absent_or_stale_refs() {
+    let mut src = blank();
+    let live = src.add(PdfString::text("live"));
+    let mut head = live;
+    for _ in 0..3_000 {
+        head = src.add(Object::Array(vec![Object::Ref(head)]));
+    }
+    fdf_note_with_data(&mut src, Object::Array(vec![Object::Ref(head), Object::Ref(ObjRef::new(999_999, 0)), Object::Ref(ObjRef::new(live.num, 1))]));
+    let fdf = Document::open(Arc::new(export_fdf(&src, true, false, "source.pdf").unwrap())).unwrap();
+    let data = exported_note_data(&fdf);
+    let data = data.as_array().unwrap();
+    assert_eq!(*fdf.resolve(&data[1]), Object::Null);
+    assert_eq!(*fdf.resolve(&data[2]), Object::Null);
+    let mut current = data[0].clone();
+    for _ in 0..3_000 {
+        current = fdf.resolve(&current).as_array().unwrap()[0].clone();
+    }
+    assert_eq!(fdf.resolve(&current).as_string().unwrap().to_text(), "live");
+}
+
+#[test]
+fn fdf_export_refuses_excessive_direct_depth_values_and_payload() {
+    let mut src = blank();
+    let mut deep = Object::Null;
+    for _ in 0..70 {
+        deep = Object::Array(vec![deep]);
+    }
+    fdf_note_with_data(&mut src, deep);
+    assert_eq!(export_fdf(&src, true, false, "source.pdf"), Err(DataError::ExportLimit("64 direct nesting levels")));
+    // Not exporting comments must not inspect their extension data.
+    assert!(export_fdf(&src, false, true, "source.pdf").is_ok());
+
+    let mut src = blank();
+    fdf_note_with_data(&mut src, Object::Array(vec![Object::Null; MAX_FDF_OBJECTS + 1]));
+    assert_eq!(export_fdf(&src, true, false, "source.pdf"), Err(DataError::ExportLimit("100,000 values")));
+
+    let mut src = blank();
+    let stream = src.add(pdfcraft_cos::Stream::from_raw(Dict::new(), vec![0; MAX_FDF_BYTES + 1]));
+    fdf_note_with_data(&mut src, Object::Ref(stream));
+    assert_eq!(export_fdf(&src, true, false, "source.pdf"), Err(DataError::ExportLimit("64 MiB data")));
 }
