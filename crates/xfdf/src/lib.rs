@@ -499,12 +499,29 @@ impl FdfCopy {
         Ok((index, number))
     }
 
+    fn value(&mut self) -> Result<(), DataError> {
+        self.nodes = self.nodes.checked_sub(1).ok_or(DataError::ExportLimit("100,000 values"))?;
+        // Delimiters, spacing and even the longest finite f64 in plain decimal form.
+        self.charge(330)
+    }
+
     fn dict(&mut self, dict: &Dict, depth: usize) -> Result<Dict, DataError> {
-        if dict.len() > self.nodes {
+        self.dict_without(dict, depth, &[])
+    }
+
+    fn annotation(&mut self, dict: &Dict) -> Result<Dict, DataError> {
+        self.value()?;
+        self.dict_without(dict, 0, &[&b"P"[..], b"AP", b"Popup", b"IRT", b"Parent", b"FS", b"Sound"])
+    }
+
+    fn dict_without(&mut self, dict: &Dict, depth: usize, omitted: &[&[u8]]) -> Result<Dict, DataError> {
+        // Even after every omitted key is removed, an oversized dictionary cannot fit.
+        // Every retained value is charged again below before it is copied.
+        if dict.len().saturating_sub(omitted.len()) > self.nodes {
             return Err(DataError::ExportLimit("100,000 values"));
         }
         let mut out = Dict::new();
-        for (key, value) in dict.iter() {
+        for (key, value) in dict.iter().filter(|(key, _)| !omitted.contains(&key.as_slice())) {
             self.charge(key.len().saturating_mul(3).saturating_add(2))?;
             out.set(key.clone(), self.copy(value, depth + 1)?);
         }
@@ -515,9 +532,7 @@ impl FdfCopy {
         if depth > MAX_DEPTH {
             return Err(DataError::ExportLimit("64 direct nesting levels"));
         }
-        self.nodes = self.nodes.checked_sub(1).ok_or(DataError::ExportLimit("100,000 values"))?;
-        // Includes delimiters, spacing and even the longest finite f64 in plain decimal form.
-        self.charge(330)?;
+        self.value()?;
         Ok(match value {
             Object::Ref(source) => {
                 let number = if let Some(number) = self.numbers.get(source) {
@@ -623,15 +638,19 @@ pub fn export_fdf(doc: &Document, comments: bool, fields: bool, file: &str) -> R
     }
     if comments {
         // Every exported comment with its source reference, numbered in export order.
-        let mut picked: Vec<(Option<ObjRef>, Dict, usize)> = Vec::new();
+        // Repeated references share their object until the budgeted copy below. Cloning
+        // each dictionary here could expand a small alias list into unbounded data.
+        let mut picked: Vec<(Option<ObjRef>, std::sync::Arc<Object>, usize)> = Vec::new();
         for (pi, p) in pdfcraft_model::pages(doc).iter().enumerate() {
-            for a in p.dict.get(b"Annots").map(|a| doc.resolve(a)).and_then(|a| a.as_array().cloned()).unwrap_or_default() {
-                let Some(d) = doc.resolve(&a).as_dict().cloned() else { continue };
+            let annots = p.dict.get(b"Annots").map(|a| doc.resolve(a));
+            for a in annots.as_ref().and_then(|a| a.as_array()).into_iter().flatten() {
+                let value = doc.resolve(a);
+                let Some(d) = value.as_dict() else { continue };
                 if d.name(b"Subtype").is_some_and(|sub| SUBTYPES.iter().any(|(s, _)| s.as_bytes() == sub)) {
                     if picked.len() >= MAX_FDF_OBJECTS {
                         return Err(DataError::ExportLimit("100,000 comments"));
                     }
-                    picked.push((a.as_ref(), d, pi));
+                    picked.push((a.as_ref(), value, pi));
                 }
             }
         }
@@ -644,16 +663,15 @@ pub fn export_fdf(doc: &Document, comments: bool, fields: bool, file: &str) -> R
         }
         copy.numbers = numbers.clone();
         let count = picked.len();
-        for (index, (_, mut d, pi)) in picked.into_iter().enumerate() {
+        for (index, (_, value, pi)) in picked.into_iter().enumerate() {
+            let d = value.as_dict().ok_or_else(|| DataError::Malformed("FDF comment is not a dictionary".into()))?;
             // A reply points at its parent's object in this FDF; a parent that isn't exported
             // leaves the reply unthreaded.
             let irt = d.get(b"IRT").and_then(Object::as_ref).and_then(|r| numbers.get(&r)).copied();
             // Source-document links and appearances are deliberately outside comment exchange.
-            for k in [&b"P"[..], b"AP", b"Popup", b"IRT", b"Parent", b"FS", b"Sound"] {
-                d.remove(k);
-            }
-            let copied = copy.copy(&Object::Dict(d), 0)?;
-            let Object::Dict(mut d) = copied else { return Err(DataError::Malformed("FDF comment is not a dictionary".into())) };
+            // Filter the borrowed dictionary while copying; cloning it first would allocate
+            // its direct strings/arrays before either export budget could refuse them.
+            let mut d = copy.annotation(d)?;
             if let Some(num) = irt {
                 d.set(b"IRT".to_vec(), Object::Ref(ObjRef::new(num, 0)));
             }

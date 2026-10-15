@@ -1157,5 +1157,23 @@ fn fdf_export_refuses_excessive_direct_depth_values_and_payload() {
     let stream = src.add(pdfcraft_cos::Stream::from_raw(Dict::new(), vec![0; MAX_FDF_BYTES + 1]));
     fdf_note_with_data(&mut src, Object::Ref(stream));
     assert_eq!(export_fdf(&src, true, false, "source.pdf"), Err(DataError::ExportLimit("64 MiB data")));
+
+    let mut src = blank();
+    // Strings need up to four serialized bytes per source byte. Refuse before copying
+    // the direct payload, just as the indirect stream case above refuses its raw data.
+    fdf_note_with_data(&mut src, Object::String(PdfString::literal(vec![b'x'; MAX_FDF_BYTES / 4 + 1])));
+    assert_eq!(export_fdf(&src, true, false, "source.pdf"), Err(DataError::ExportLimit("64 MiB data")));
 }
 
+#[test]
+fn fdf_export_refuses_aliases_before_cloning_large_annotation_values() {
+    let mut src = blank();
+    fdf_note_with_data(&mut src, Object::Array(vec![Object::Null; 1_024]));
+    let page = pdfcraft_model::pages(&src)[0].obj;
+    let annots = src.get(page).as_dict().unwrap().get(b"Annots").unwrap().clone();
+    let note = annots.as_array().unwrap()[0].as_ref().unwrap();
+    // The source holds one 1,024-value dictionary. The aliases must not clone its
+    // values a hundred thousand times before the comment-count refusal is reached.
+    src.update_dict(page, |dict| dict.set(b"Annots".to_vec(), Object::Array(vec![Object::Ref(note); MAX_FDF_OBJECTS + 1]))).unwrap();
+    assert_eq!(export_fdf(&src, true, false, "source.pdf"), Err(DataError::ExportLimit("100,000 comments")));
+}
