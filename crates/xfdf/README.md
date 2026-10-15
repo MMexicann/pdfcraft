@@ -4,7 +4,7 @@ Layer L4: comment and form data exchange (execution plan M5.6, M6.7).
 
 ```rust
 let xml = export_xfdf(&doc, true, true, "form.pdf");   // comments and/or field values
-let fdf = export_fdf(&doc, false, true, "form.pdf")?;
+let fdf = export_fdf(&doc, false, true, "form.pdf");
 let txt = export_data(&doc, Format::Txt);               // or Xml, Csv
 let report = import(&mut doc, &bytes)?;                 // XFDF, FDF, XML, CSV or text, detected
 ```
@@ -13,12 +13,18 @@ let report = import(&mut doc, &bytes)?;                 // XFDF, FDF, XML, CSV o
   circle, polygon, polyline, markup, stamp, caret, ink, attachments, sound, redact) with rect,
   name, author, subject, dates, flags, colours, opacity, width, icon, quads, line ends, ink,
   default appearance, callouts (`callout`, `fringe`, `intent`, `head`), pop-ups and reply threads
-  (`inreplyto`); field values nested by name.
+  (`inreplyto`); field values nested by name, with text preserved across XML comments and processing instructions.
 - **FDF**: fields (with `/Kids` hierarchies) and indirect comments. Nested annotation values
   are copied under FDF object numbers; shared references and cycles remain shared. Document
-  links and appearances are excluded. Export returns `Result` and refuses graphs above
-  100,000 objects/values, 64 direct nesting levels or a conservative 64 MiB serialization
-  budget instead of exporting partial data. Unknown indirect streams retain their encoded bytes.
+  links and appearances are excluded. Discovery borrows direct arrays and dictionaries,
+  retains array owners lazily and records annotation positions instead of resolved bodies.
+  Retained entries are budgeted before their keys or values are cloned, including when
+  saved-PDF cache eviction causes annotation bodies to be parsed again. Export returns
+  `Result` and refuses copied graphs above 100,000 comments/objects/values, 64 direct nesting
+  levels or a conservative 64 MiB serialization budget instead of exporting partial data.
+  These are copied-graph limits: source parsing and page discovery retain their existing
+  COS/parser limits, with no total source-memory bound. Unknown indirect streams retain their
+  encoded bytes. FDF import semantics are unchanged.
 - **Form data**: Acrobat's XML (`xfdf:original` keeps names that aren't XML names), CSV and
   tab-delimited text (a row of names, a row of values).
 
