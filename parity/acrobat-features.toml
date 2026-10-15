@@ -334,8 +334,8 @@ milestone = "M1"
 status = "shipped"
 commands = []
 tools = []
-evidence = ["crates/cos/tests/generations.rs::overlay_generation_changes_do_not_retarget_old_references_or_clones", "crates/cos/tests/generations.rs::references_require_the_current_generation_even_with_a_warm_cache", "crates/cos/src/document.rs::reads_classic_revision_and_edits_are_copy_on_write"]
-notes = "Generation-aware references stay distinct across warm caches, edit overlays and snapshots, including incremental save/reopen. Broader real-file fidelity remains tracked separately."
+evidence = ["crates/cos/tests/generations.rs::restoring_snapshot_preserves_changes_to_nonzero_generation_objects", "crates/cos/tests/generations.rs::overlay_generation_changes_do_not_retarget_old_references_or_clones", "crates/cos/tests/generations.rs::references_require_the_current_generation_even_with_a_warm_cache", "crates/cos/src/document.rs::reads_classic_revision_and_edits_are_copy_on_write"]
+notes = "Generation-aware references stay distinct across warm caches, edit overlays and snapshots, including restoration and incremental save/reopen of edited nonzero-generation objects. Broader real-file fidelity remains tracked separately."
 
 [[feature]]
 id = "core.write-validity"

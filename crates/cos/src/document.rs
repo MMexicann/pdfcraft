@@ -1229,7 +1229,7 @@ impl Document {
                 let generation = current.generation(num);
                 let same = saved_nums.binary_search(&num).is_ok()
                     && self.generation(num) == generation
-                    && saved_reader.try_get(ObjRef::new(num, 0))? == current_reader.try_get(ObjRef::new(num, 0))?;
+                    && saved_reader.try_get(ObjRef::new(num, generation))? == current_reader.try_get(ObjRef::new(num, generation))?;
                 if !same {
                     changed.push(num);
                 }
@@ -1242,7 +1242,7 @@ impl Document {
         let mut current_reader = current.object_reader();
         for num in changed {
             let generation = current.generation(num);
-            let object = current_reader.try_get(ObjRef::new(num, 0))?;
+            let object = current_reader.try_get(ObjRef::new(num, generation))?;
             self.set(ObjRef::new(num, generation), (*object).clone());
         }
         *self.trailer_mut() = current.trailer().clone();

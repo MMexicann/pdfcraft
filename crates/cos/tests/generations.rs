@@ -70,6 +70,25 @@ fn overlay_generation_changes_do_not_retarget_old_references_or_clones() {
 }
 
 #[test]
+fn restoring_snapshot_preserves_changes_to_nonzero_generation_objects() {
+    for generation in [1, 2] {
+        let mut saved = Document::open(reused_object()).unwrap();
+        let mut current = saved.clone();
+        let reference = ObjRef::new(3, generation);
+        current.set(reference, Object::Int(99));
+        current.update_dict(current.root().unwrap(), |catalog| catalog.set(b"Current".to_vec(), Object::Ref(reference))).unwrap();
+
+        saved.overlay_changes_from(&current).unwrap();
+        assert_eq!(*saved.get(reference), Object::Int(99), "generation {generation}");
+        let back = Document::open(Arc::new(write_incremental(&saved, &SaveOptions::default()).unwrap())).unwrap();
+        assert!(back.repair_log().is_empty());
+        assert_eq!(*back.get(reference), Object::Int(99), "generation {generation}");
+        let catalog = back.get(back.root().unwrap());
+        assert_eq!(*back.resolve(catalog.as_dict().unwrap().get(b"Current").unwrap()), Object::Int(99));
+    }
+}
+
+#[test]
 fn full_save_does_not_turn_stale_references_into_live_ones() {
     let doc = Document::open(reused_object()).unwrap();
     for object_streams in [false, true] {
