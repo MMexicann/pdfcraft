@@ -469,6 +469,29 @@ fn pdf_string(s: &str) -> Vec<u8> {
 const MAX_FDF_OBJECTS: usize = 100_000;
 const MAX_FDF_BYTES: usize = 64 * 1024 * 1024;
 
+/// Direct values stay borrowed: `Document::resolve` would deep-clone them. Only
+/// indirect values need an owner, and annotation bodies are never retained in discovery.
+enum FdfValue<'a> {
+    Borrowed(&'a Object),
+    Indirect(std::sync::Arc<Object>),
+}
+
+impl<'a> FdfValue<'a> {
+    fn resolve(doc: &Document, value: &'a Object) -> Self {
+        match value {
+            Object::Ref(_) => Self::Indirect(doc.resolve(value)),
+            _ => Self::Borrowed(value),
+        }
+    }
+
+    fn object(&self) -> &Object {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Indirect(value) => value.as_ref(),
+        }
+    }
+}
+
 struct FdfCopy {
     objects: Vec<Object>,
     numbers: HashMap<ObjRef, u32>,
@@ -499,40 +522,50 @@ impl FdfCopy {
         Ok((index, number))
     }
 
-    fn value(&mut self) -> Result<(), DataError> {
-        self.nodes = self.nodes.checked_sub(1).ok_or(DataError::ExportLimit("100,000 values"))?;
-        // Delimiters, spacing and even the longest finite f64 in plain decimal form.
-        self.charge(330)
-    }
-
     fn dict(&mut self, dict: &Dict, depth: usize) -> Result<Dict, DataError> {
-        self.dict_without(dict, depth, &[])
-    }
-
-    fn annotation(&mut self, dict: &Dict) -> Result<Dict, DataError> {
-        self.value()?;
-        self.dict_without(dict, 0, &[&b"P"[..], b"AP", b"Popup", b"IRT", b"Parent", b"FS", b"Sound"])
-    }
-
-    fn dict_without(&mut self, dict: &Dict, depth: usize, omitted: &[&[u8]]) -> Result<Dict, DataError> {
-        // Even after every omitted key is removed, an oversized dictionary cannot fit.
-        // Every retained value is charged again below before it is copied.
-        if dict.len().saturating_sub(omitted.len()) > self.nodes {
+        if dict.len() > self.nodes {
             return Err(DataError::ExportLimit("100,000 values"));
         }
         let mut out = Dict::new();
-        for (key, value) in dict.iter().filter(|(key, _)| !omitted.contains(&key.as_slice())) {
-            self.charge(key.len().saturating_mul(3).saturating_add(2))?;
-            out.set(key.clone(), self.copy(value, depth + 1)?);
+        for (key, value) in dict.iter() {
+            self.dict_entry(&mut out, key, value, depth + 1)?;
         }
         Ok(out)
     }
 
-    fn copy(&mut self, value: &Object, depth: usize) -> Result<Object, DataError> {
+    fn dict_entry(&mut self, out: &mut Dict, key: &[u8], value: &Object, depth: usize) -> Result<(), DataError> {
+        self.charge(key.len().saturating_mul(3).saturating_add(2))?;
+        let value = self.copy(value, depth)?;
+        out.set(key.to_vec(), value);
+        Ok(())
+    }
+
+    /// Skip source-document links and appearances without cloning their values. The
+    /// dictionary and every retained entry are charged before any owned copy is made.
+    fn annotation_dict(&mut self, dict: &Dict) -> Result<Dict, DataError> {
+        self.charge_value(0)?;
+        let mut out = Dict::new();
+        for (key, value) in dict.iter() {
+            if matches!(key.as_slice(), b"P" | b"AP" | b"Popup" | b"IRT" | b"Parent" | b"FS" | b"Sound") {
+                continue;
+            }
+            self.dict_entry(&mut out, key, value, 1)?;
+        }
+        Ok(out)
+    }
+
+    fn charge_value(&mut self, depth: usize) -> Result<(), DataError> {
         if depth > MAX_DEPTH {
             return Err(DataError::ExportLimit("64 direct nesting levels"));
         }
-        self.value()?;
+        self.nodes = self.nodes.checked_sub(1).ok_or(DataError::ExportLimit("100,000 values"))?;
+        // Includes delimiters, spacing and even the longest finite f64 in plain decimal form.
+        self.charge(330)?;
+        Ok(())
+    }
+
+    fn copy(&mut self, value: &Object, depth: usize) -> Result<Object, DataError> {
+        self.charge_value(depth)?;
         Ok(match value {
             Object::Ref(source) => {
                 let number = if let Some(number) = self.numbers.get(source) {
@@ -614,7 +647,10 @@ pub fn export_fdf(doc: &Document, comments: bool, fields: bool, file: &str) -> R
             if matches!(f.kind, FieldKind::PushButton | FieldKind::Signature) {
                 continue;
             }
-            copy.nodes = copy.nodes.checked_sub(1).ok_or(DataError::ExportLimit("100,000 values"))?;
+            // Field dictionary, /T string and /V scalar/array, plus every emitted list
+            // entry. Other field kinds emit only their first value (or a default).
+            let field_nodes = if matches!(f.kind, FieldKind::List) && f.value.len() > 1 { f.value.len().saturating_add(3) } else { 3 };
+            copy.nodes = copy.nodes.checked_sub(field_nodes).ok_or(DataError::ExportLimit("100,000 values"))?;
             copy.charge(f.name.len().saturating_mul(8).saturating_add(100))?;
             for value in &f.value {
                 copy.charge(value.len().saturating_mul(8).saturating_add(100))?;
@@ -637,22 +673,29 @@ pub fn export_fdf(doc: &Document, comments: bool, fields: bool, file: &str) -> R
         body.extend_from_slice(b"] ");
     }
     if comments {
-        // Every exported comment with its source reference, numbered in export order.
-        // Repeated references share their object until the budgeted copy below. Cloning
-        // each dictionary here could expand a small alias list into unbounded data.
-        let mut picked: Vec<(Option<ObjRef>, std::sync::Arc<Object>, usize)> = Vec::new();
-        for (pi, p) in pdfcraft_model::pages(doc).iter().enumerate() {
-            let annots = p.dict.get(b"Annots").map(|a| doc.resolve(a));
-            for a in annots.as_ref().and_then(|a| a.as_array()).into_iter().flatten() {
-                let value = doc.resolve(a);
-                let Some(d) = value.as_dict() else { continue };
-                if d.name(b"Subtype").is_some_and(|sub| SUBTYPES.iter().any(|(s, _)| s.as_bytes() == sub)) {
-                    if picked.len() >= MAX_FDF_OBJECTS {
-                        return Err(DataError::ExportLimit("100,000 comments"));
+        // Keep the page/array owners once. Handles retain positions, never annotation
+        // bodies: the document cache can evict and reparse even a repeated source reference.
+        let pages = pdfcraft_model::pages(doc);
+        let mut arrays = Vec::new();
+        let mut picked: Vec<(Option<ObjRef>, usize, usize)> = Vec::new();
+        for (pi, page) in pages.iter().enumerate() {
+            let owner = page.dict.get(b"Annots").map(|value| FdfValue::resolve(doc, value));
+            let before = picked.len();
+            if let Some(values) = owner.as_ref().and_then(|owner| owner.object().as_array()) {
+                for (ai, a) in values.iter().enumerate() {
+                    let value = FdfValue::resolve(doc, a);
+                    let Some(d) = value.object().as_dict() else { continue };
+                    if d.name(b"Subtype").is_some_and(|sub| SUBTYPES.iter().any(|(s, _)| s.as_bytes() == sub)) {
+                        if picked.len() >= MAX_FDF_OBJECTS {
+                            return Err(DataError::ExportLimit("100,000 comments"));
+                        }
+                        picked.push((a.as_ref(), pi, ai));
                     }
-                    picked.push((a.as_ref(), value, pi));
                 }
             }
+            // Empty/unselected arrays need no owner. Resolve subsequent pages only after
+            // this page passes the cap, rather than loading them all before discovery.
+            arrays.push(if picked.len() > before { owner } else { None });
         }
         let mut numbers = HashMap::new();
         for (source, _, _) in &picked {
@@ -663,15 +706,19 @@ pub fn export_fdf(doc: &Document, comments: bool, fields: bool, file: &str) -> R
         }
         copy.numbers = numbers.clone();
         let count = picked.len();
-        for (index, (_, value, pi)) in picked.into_iter().enumerate() {
-            let d = value.as_dict().ok_or_else(|| DataError::Malformed("FDF comment is not a dictionary".into()))?;
+        for (index, (_, pi, ai)) in picked.into_iter().enumerate() {
+            let annotation = arrays
+                .get(pi)
+                .and_then(Option::as_ref)
+                .and_then(|owner| owner.object().as_array())
+                .and_then(|values| values.get(ai))
+                .ok_or_else(|| DataError::Malformed("FDF annotation slot is missing".into()))?;
+            let value = FdfValue::resolve(doc, annotation);
+            let d = value.object().as_dict().ok_or_else(|| DataError::Malformed("FDF comment is not a dictionary".into()))?;
             // A reply points at its parent's object in this FDF; a parent that isn't exported
             // leaves the reply unthreaded.
             let irt = d.get(b"IRT").and_then(Object::as_ref).and_then(|r| numbers.get(&r)).copied();
-            // Source-document links and appearances are deliberately outside comment exchange.
-            // Filter the borrowed dictionary while copying; cloning it first would allocate
-            // its direct strings/arrays before either export budget could refuse them.
-            let mut d = copy.annotation(d)?;
+            let mut d = copy.annotation_dict(d)?;
             if let Some(num) = irt {
                 d.set(b"IRT".to_vec(), Object::Ref(ObjRef::new(num, 0)));
             }

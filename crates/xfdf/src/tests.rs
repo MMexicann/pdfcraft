@@ -1177,3 +1177,69 @@ fn fdf_export_refuses_aliases_before_cloning_large_annotation_values() {
     src.update_dict(page, |dict| dict.set(b"Annots".to_vec(), Object::Array(vec![Object::Ref(note); MAX_FDF_OBJECTS + 1]))).unwrap();
     assert_eq!(export_fdf(&src, true, false, "source.pdf"), Err(DataError::ExportLimit("100,000 comments")));
 }
+
+#[test]
+fn fdf_export_refuses_repeated_saved_annotations_after_cache_eviction() {
+    let bytes = {
+        let mut src = blank();
+        let page = pdfcraft_model::pages(&src)[0].obj;
+        let mut notes = Vec::new();
+        // More than the editor cache's 1,024 objects. Four passes force reparsing;
+        // retaining each resolved body during discovery would pin all four copies.
+        for _ in 0..1_025 {
+            let mut note = Dict::new();
+            note.set(b"Type".to_vec(), Object::name("Annot"));
+            note.set(b"Subtype".to_vec(), Object::name("Square"));
+            note.set(b"Rect".to_vec(), Object::Array(vec![10.into(), 20.into(), 30.into(), 40.into()]));
+            note.set(b"PCData".to_vec(), Object::Array(vec![Object::Null; 1_024]));
+            notes.push(Object::Ref(src.add(note)));
+        }
+        let aliases = (0..4).flat_map(|_| notes.iter().cloned()).collect();
+        src.update_dict(page, |dict| dict.set(b"Annots".to_vec(), Object::Array(aliases))).unwrap();
+        write_full(&src, &SaveOptions { object_streams: false, ..SaveOptions::default() }).unwrap()
+    };
+    // Drop the overlay-backed source before reopening: its persistent Arc objects
+    // would hide the parsed-object cache eviction exercised by this fixture.
+    let src = Document::open(Arc::new(bytes)).unwrap();
+    assert!(src.repair_log().is_empty());
+    assert_eq!(export_fdf(&src, true, false, "source.pdf"), Err(DataError::ExportLimit("100,000 values")));
+}
+
+#[test]
+fn fdf_export_counts_emitted_field_values_before_allocating_lists() {
+    let field_document = |kind: &str, count: usize| {
+        let mut doc = Document::new_empty();
+        let mut field = Dict::new();
+        field.set(b"FT".to_vec(), Object::name(kind));
+        field.set(b"T".to_vec(), PdfString::text("Pick"));
+        field.set(b"Ff".to_vec(), Object::Int(1 << 21)); // multi-select for a /Ch list
+        field.set(b"V".to_vec(), Object::Array(vec![Object::String(PdfString::text("")); count]));
+        let field = doc.add(field);
+        let mut form = Dict::new();
+        form.set(b"Fields".to_vec(), Object::Array(vec![Object::Ref(field)]));
+        doc.update_dict(doc.root().unwrap(), |root| root.set(b"AcroForm".to_vec(), Object::Dict(form))).unwrap();
+        assert_eq!(fields(&doc)[0].value.len(), count);
+        doc
+    };
+
+    // A field dictionary, /T string and /V array use three nodes before its entries.
+    let doc = field_document("Ch", MAX_FDF_OBJECTS - 3);
+    assert_eq!(fields(&doc)[0].kind, FieldKind::List);
+    let bytes = export_fdf(&doc, false, true, "field.pdf").unwrap();
+    assert_eq!(data_values(&bytes).unwrap()[0].1.len(), MAX_FDF_OBJECTS - 3);
+    for count in [MAX_FDF_OBJECTS - 2, MAX_FDF_OBJECTS + 1] {
+        let doc = field_document("Ch", count);
+        assert!(matches!(export_fdf(&doc, false, true, "field.pdf"), Err(DataError::ExportLimit("100,000 values"))));
+    }
+
+    // A hostile array on a scalar field still emits just its first string. The node
+    // budget counts output values, rather than charging entries that are not copied.
+    let doc = field_document("Tx", MAX_FDF_OBJECTS + 1);
+    assert_eq!(fields(&doc)[0].kind, FieldKind::Text);
+    let bytes = export_fdf(&doc, false, true, "field.pdf").unwrap();
+    let fdf = Document::open(Arc::new(bytes)).unwrap();
+    let body = fdf_body(&fdf).unwrap();
+    let exported = fdf.resolve(body.get(b"Fields").unwrap());
+    let exported = fdf.resolve(&exported.as_array().unwrap()[0]);
+    assert!(matches!(exported.as_dict().unwrap().get(b"V"), Some(Object::String(_))));
+}
