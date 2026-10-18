@@ -18,7 +18,8 @@ let report = import(&mut doc, &bytes)?;                 // XFDF, FDF, XML, CSV o
   are copied under FDF object numbers; shared references and cycles remain shared. Document
   links and appearances are excluded. Source `/Page` and `/Pages` dictionaries become null
   at every copy depth, so nested destination actions cannot carry the source page tree or content.
-  Type names may be indirect; lookup is iterative, stops at cycles and refuses chains beyond
+  Type names may be indirect; lookup checks each reference generation, is iterative, stops at
+  cycles and refuses chains beyond
   64 references. Discovery borrows direct arrays and dictionaries,
   retains array owners lazily and records annotation positions instead of resolved bodies.
   Retained entries are budgeted before their keys or values are cloned, including when
