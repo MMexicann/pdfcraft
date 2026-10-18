@@ -1472,3 +1472,33 @@ fn fdf_export_bounds_indirect_type_alias_lookups() {
         }
     }
 }
+
+#[test]
+fn fdf_export_preserves_metadata_with_stale_type_references() {
+    for alias in [false, true] {
+        let mut doc = blank();
+        let current = doc.add(Object::name("Page"));
+        doc.update_dict(doc.root().unwrap(), |dict| dict.set(b"PCPageType".to_vec(), Object::Ref(current))).unwrap();
+        let mut doc = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+        let current = doc.get(doc.root().unwrap()).as_dict().unwrap().reference(b"PCPageType").unwrap();
+        let stale = ObjRef::new(current.num, current.generation + 1);
+        let page_type = if alias { doc.add(Object::Ref(stale)) } else { stale };
+        let mut metadata = Dict::new();
+        metadata.set(b"Type".to_vec(), Object::Ref(page_type));
+        metadata.set(b"Label".to_vec(), PdfString::text("preserved despite stale type"));
+        fdf_note_with_data(&mut doc, Object::Dict(metadata));
+        assert_eq!(doc.generation(stale.num), current.generation);
+        // A warm number-keyed cache must not make the stale Type reference live.
+        assert_eq!(*doc.try_get(stale.num).unwrap(), Object::name("Page"));
+        let bytes = export_fdf(&doc, true, false, "").unwrap();
+        let fdf = Document::open(Arc::new(bytes)).unwrap();
+        let data = exported_note_data(&fdf);
+        let metadata = data.as_dict().expect("stale Type must not classify unrelated metadata as a source page");
+        assert_eq!(metadata.get(b"Label").unwrap().as_string().unwrap().to_text(), "preserved despite stale type");
+        let mut page_type = fdf.resolve(metadata.get(b"Type").unwrap());
+        if alias {
+            page_type = fdf.resolve(&page_type);
+        }
+        assert_eq!(*page_type, Object::Null);
+    }
+}

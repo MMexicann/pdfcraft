@@ -570,14 +570,17 @@ impl<'a> FdfCopy<'a> {
 
     fn is_source_page(&self, dict: &Dict) -> Result<bool, DataError> {
         let Some(value) = dict.get(b"Type") else { return Ok(false) };
-        let mut value = FdfValue::resolve(self.doc, value);
+        let mut value = FdfValue::Borrowed(value);
         let mut seen = HashSet::new();
-        for _ in 0..MAX_DEPTH {
+        for hops in 0..=MAX_DEPTH {
             match value.object() {
                 Object::Name(name) => return Ok(matches!(name.as_slice(), b"Page" | b"Pages")),
                 Object::Ref(reference) => {
-                    if !seen.insert(*reference) {
+                    if self.doc.generation(reference.num) != reference.generation || !seen.insert(*reference) {
                         return Ok(false);
+                    }
+                    if hops == MAX_DEPTH {
+                        return Err(DataError::ExportLimit("64 Type reference levels"));
                     }
                     value = FdfValue::Indirect(self.doc.get(*reference));
                 }
