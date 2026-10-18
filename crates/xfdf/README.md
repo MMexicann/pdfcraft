@@ -4,7 +4,7 @@ Layer L4: comment and form data exchange (execution plan M5.6, M6.7).
 
 ```rust
 let xml = export_xfdf(&doc, true, true, "form.pdf");   // comments and/or field values
-let fdf = export_fdf(&doc, false, true, "form.pdf");
+let fdf = export_fdf(&doc, false, true, "form.pdf")?;
 let txt = export_data(&doc, Format::Txt);               // or Xml, Csv
 let report = import(&mut doc, &bytes)?;                 // XFDF, FDF, XML, CSV or text, detected
 ```
