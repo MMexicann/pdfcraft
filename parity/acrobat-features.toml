@@ -70,8 +70,8 @@ milestone = "M1"
 status = "shipped"
 commands = []
 tools = ["doc_info"]
-evidence = ["crates/ui-egui/tests/viewer.rs::damaged_files_say_they_were_repaired"]
-notes = "a notice says the file was repaired; Document Properties ▸ Advanced lists the repairs; doc_info reports them"
+evidence = ["crates/ui-egui/tests/viewer.rs::damaged_files_say_they_were_repaired", "crates/cos/tests/generations.rs::contradictory_xref_generation_recovers_the_matching_header_and_records_repair", "crates/cos/tests/generations.rs::generation_repair_diagnostics_are_bounded_without_disabling_recovery"]
+notes = "a notice says the file was repaired; Document Properties ▸ Advanced lists the repairs; doc_info reports them. COS records bounded live xref/header generation disagreements on open; this follow-up validates the COS policy, without a fresh GUI claim."
 
 [[feature]]
 id = "core.xref-streams"
@@ -334,8 +334,8 @@ milestone = "M1"
 status = "shipped"
 commands = []
 tools = []
-evidence = ["crates/cos/tests/generations.rs::restoring_snapshot_preserves_changes_to_nonzero_generation_objects", "crates/cos/tests/generations.rs::overlay_generation_changes_do_not_retarget_old_references_or_clones", "crates/cos/tests/generations.rs::references_require_the_current_generation_even_with_a_warm_cache", "crates/cos/src/document.rs::reads_classic_revision_and_edits_are_copy_on_write"]
-notes = "Generation-aware references stay distinct across warm caches, edit overlays and snapshots, including restoration and incremental save/reopen of edited nonzero-generation objects. Broader real-file fidelity remains tracked separately."
+evidence = ["crates/cos/tests/generations.rs::free_xref_slots_never_revive_retained_object_headers", "crates/cos/tests/generations.rs::repaired_header_references_survive_full_saves_and_dictionary_edits", "crates/cos/tests/generations.rs::incremental_generation_identity_is_visible_to_an_independent_reader", "crates/cos/tests/generations.rs::restoring_snapshot_preserves_changes_to_nonzero_generation_objects", "crates/cos/tests/generations.rs::overlay_generation_changes_do_not_retarget_old_references_or_clones", "crates/cos/tests/generations.rs::references_require_the_current_generation_even_with_a_warm_cache", "crates/cos/src/document.rs::reads_classic_revision_and_edits_are_copy_on_write"]
+notes = "Generation-aware references stay distinct across warm caches, edit overlays and snapshots, including restoration and incremental save/reopen of edited nonzero-generation objects. A damaged live xref row may additionally resolve the matching same-number object header; unrelated generations and free slots remain null. Synthetic edit/full-save/incremental controls include an independent reader. Broader real-file fidelity remains tracked separately."
 
 [[feature]]
 id = "core.write-validity"
