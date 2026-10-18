@@ -15,20 +15,158 @@ fn reused_object() -> Arc<Vec<u8>> {
 }
 
 fn object_file(objects: &[(u32, u16, &str)]) -> Arc<Vec<u8>> {
+    object_file_with_entry(objects, None)
+}
+
+fn object_file_with_entry(objects: &[(u32, u16, &str)], changed: Option<(u32, u16, bool)>) -> Arc<Vec<u8>> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
     for (num, generation, value) in objects {
-        offsets.push((bytes.len(), generation));
+        offsets.push((*num, bytes.len(), *generation));
         bytes.extend_from_slice(format!("{num} {generation} obj\n{value}\nendobj\n").as_bytes());
     }
     let xref = bytes.len();
     let size = objects.len() + 1;
     bytes.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
-    for (offset, generation) in offsets {
-        bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+    for (num, offset, generation) in offsets {
+        let (generation, free) = changed.filter(|(n, _, _)| *n == num).map_or((generation, false), |(_, g, free)| (g, free));
+        let (offset, kind) = if free { (0, 'f') } else { (offset, 'n') };
+        bytes.extend_from_slice(format!("{offset:010} {generation:05} {kind} \n").as_bytes());
     }
     bytes.extend_from_slice(format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
     Arc::new(bytes)
+}
+
+fn contradictory_entry(free: bool) -> Arc<Vec<u8>> {
+    object_file_with_entry(
+        &[(1, 0, "<< /Type /Catalog /Pages 2 0 R /Stale 3 0 R /Current 3 1 R >>"), (2, 0, "<< /Type /Pages /Kids [] /Count 0 >>"), (3, 1, "42")],
+        Some((3, if free { 2 } else { 0 }, free)),
+    )
+}
+
+#[test]
+fn contradictory_xref_generation_recovers_the_matching_header_and_records_repair() {
+    for warm in [false, true] {
+        let doc = Document::open(contradictory_entry(false)).unwrap();
+        if warm {
+            assert_eq!(*doc.try_get(3).unwrap(), Object::Int(42));
+        }
+        assert_eq!(*doc.get(ObjRef::new(3, 1)), Object::Int(42));
+        assert_eq!(*doc.resolve(&Object::Ref(ObjRef::new(3, 1))), Object::Int(42));
+        // Preserve the existing xref-matching behavior, but never accept an unrelated generation.
+        assert_eq!(*doc.get(ObjRef::new(3, 0)), Object::Int(42));
+        assert_eq!(*doc.get(ObjRef::new(3, 2)), Object::Null);
+        assert!(!doc.xref_entry_is_exact(3), "a contradictory generation is not an exact xref entry");
+        assert!(
+            doc.repair_log()
+                .iter()
+                .any(|line| { line.contains("object 3") && line.contains("xref generation 0") && line.contains("header generation 1") }),
+            "{:?}",
+            doc.repair_log()
+        );
+        let repairs = doc.repair_log().to_vec();
+        for _ in 0..3 {
+            assert_eq!(*doc.get(ObjRef::new(3, 1)), Object::Int(42));
+        }
+        assert_eq!(doc.repair_log(), repairs);
+
+        let mut edited = doc.clone();
+        edited.free(ObjRef::new(3, 1));
+        for generation in [0, 1, 2] {
+            assert_eq!(*edited.get(ObjRef::new(3, generation)), Object::Null);
+        }
+        edited.set(ObjRef::new(3, 2), Object::Int(99));
+        assert_eq!(*edited.get(ObjRef::new(3, 1)), Object::Null);
+        assert_eq!(*edited.get(ObjRef::new(3, 2)), Object::Int(99));
+        assert_eq!(*doc.get(ObjRef::new(3, 1)), Object::Int(42));
+    }
+}
+
+/// A damaged row may name generation zero while the retained object and catalog use one.
+fn contradictory_dictionary() -> Arc<Vec<u8>> {
+    object_file_with_entry(
+        &[(1, 0, "<< /Type /Catalog /Pages 2 0 R /Current 3 1 R >>"), (2, 0, "<< /Type /Pages /Kids [] /Count 0 >>"), (3, 1, "<< /Value 42 >>")],
+        Some((3, 0, false)),
+    )
+}
+
+fn assert_repaired_dictionary(bytes: Vec<u8>, value: i32) {
+    let bytes = Arc::new(bytes);
+    let oracle = hayro_syntax::Pdf::new(bytes.clone()).unwrap();
+    let catalog = oracle.xref().get::<HayroDict<'_>>(ObjectIdentifier::new(1, 0)).unwrap();
+    assert_eq!(catalog.get::<HayroDict<'_>>(b"Current").unwrap().get::<i32>(b"Value"), Some(value));
+    let back = Document::open(bytes).unwrap();
+    let catalog = back.get(back.root().unwrap());
+    let current = back.resolve(catalog.as_dict().unwrap().get(b"Current").unwrap());
+    assert_eq!(current.as_dict().unwrap().int(b"Value"), Some(i64::from(value)));
+}
+
+#[test]
+fn repaired_header_references_survive_full_saves_and_dictionary_edits() {
+    let original = contradictory_dictionary();
+    let doc = Document::open(original.clone()).unwrap();
+    for object_streams in [false, true] {
+        assert_repaired_dictionary(write_full(&doc, &SaveOptions { object_streams, ..SaveOptions::default() }).unwrap(), 42);
+    }
+    let mut edited = doc.clone();
+    edited.update_dict(ObjRef::new(3, 1), |dict| dict.set(b"Value".to_vec(), Object::Int(77))).unwrap();
+    assert_eq!(edited.generation(3), 1);
+    let incremental = write_incremental(&edited, &SaveOptions::default()).unwrap();
+    assert!(incremental.starts_with(&original));
+    assert_repaired_dictionary(incremental, 77);
+    for object_streams in [false, true] {
+        assert_repaired_dictionary(write_full(&edited, &SaveOptions { object_streams, ..SaveOptions::default() }).unwrap(), 77);
+    }
+    let mut restored = doc.clone();
+    restored.overlay_changes_from(&edited).unwrap();
+    assert_repaired_dictionary(write_incremental(&restored, &SaveOptions::default()).unwrap(), 77);
+}
+
+#[test]
+fn free_xref_slots_never_revive_retained_object_headers() {
+    for warm in [false, true] {
+        let doc = Document::open(contradictory_entry(true)).unwrap();
+        assert!(matches!(doc.xref_entry(3), Some(XrefEntry::Free { next_generation: 2 })));
+        if warm {
+            assert_eq!(*doc.try_get(3).unwrap(), Object::Null);
+        }
+        for generation in [0, 1, 2] {
+            assert_eq!(*doc.get(ObjRef::new(3, generation)), Object::Null);
+        }
+        assert_eq!(*doc.resolve(&Object::Ref(ObjRef::new(3, 1))), Object::Null);
+        assert!(doc.repair_log().is_empty(), "{:?}", doc.repair_log());
+    }
+    // Control: the retained bytes really are a readable object when its slot is live.
+    let live = Document::open(contradictory_entry(false)).unwrap();
+    assert_eq!(*live.try_get(3).unwrap(), Object::Int(42));
+}
+
+#[test]
+fn incremental_generation_identity_is_visible_to_an_independent_reader() {
+    let original = reused_object();
+    let mut doc = Document::open(original.clone()).unwrap();
+    doc.set(ObjRef::new(3, 1), Object::Int(77));
+    let bytes = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    assert!(bytes.starts_with(&original));
+    let oracle = hayro_syntax::Pdf::new(Arc::new(bytes)).unwrap();
+    let catalog = oracle.xref().get::<HayroDict<'_>>(ObjectIdentifier::new(1, 0)).unwrap();
+    assert_eq!(catalog.get::<i32>(b"Current"), Some(77));
+    assert_eq!(catalog.get::<i32>(b"Stale"), None);
+}
+
+#[test]
+fn generation_repair_diagnostics_are_bounded_without_disabling_recovery() {
+    let mut objects = vec![(1, 0, "<< /Type /Catalog /Pages 2 0 R >>"), (2, 0, "<< /Type /Pages /Kids [] /Count 0 >>")];
+    objects.extend((3..303).map(|num| (num, 1, "42")));
+    let bytes = object_file(&objects);
+    let bytes = String::from_utf8(bytes.as_ref().clone()).unwrap().replace("00001 n \n", "00000 n \n");
+    let doc = Document::open(Arc::new(bytes.into_bytes())).unwrap();
+    assert_eq!(doc.repair_log().len(), 257);
+    assert!(doc.repair_log().last().unwrap().contains("omitted after 256 objects"));
+    assert_eq!(*doc.get(ObjRef::new(3, 1)), Object::Int(42));
+    assert_eq!(*doc.get(ObjRef::new(302, 1)), Object::Int(42));
+    assert_eq!(*doc.get(ObjRef::new(302, 2)), Object::Null);
+    assert_eq!(doc.repair_log().len(), 257);
 }
 
 #[test]
