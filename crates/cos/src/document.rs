@@ -200,8 +200,8 @@ impl XrefSection {
         }
     }
 
-    fn extend_numbers(&self, numbers: &mut Vec<u32>) {
-        for range in &self.ranges {
+    fn numbers(&self) -> impl Iterator<Item = u32> + '_ {
+        self.ranges.iter().flat_map(|range| {
             let available = match &self.data {
                 XrefSectionData::Table => range.count as usize,
                 XrefSectionData::Stream { bytes, widths } => {
@@ -209,14 +209,12 @@ impl XrefSection {
                     bytes.len().saturating_sub(range.offset).checked_div(row_width).unwrap_or(0)
                 }
             };
-            for i in 0..available.min(range.count as usize) {
-                if let Ok(i) = u32::try_from(i)
-                    && let Some(num) = range.start.checked_add(i)
-                {
-                    numbers.push(num);
-                }
-            }
-        }
+            (0..available.min(range.count as usize)).filter_map(move |i| u32::try_from(i).ok().and_then(|i| range.start.checked_add(i)))
+        })
+    }
+
+    fn extend_numbers(&self, numbers: &mut Vec<u32>) {
+        numbers.extend(self.numbers());
     }
 }
 
@@ -629,6 +627,9 @@ impl Document {
             }
             doc.reconstruct(&mut log)?;
         }
+        // Header generations are plaintext, including in encrypted files. Inspect only the
+        // bounded headers, not object bodies, and retain the compact xref representation.
+        doc.note_xref_generation_repairs(&mut log);
         doc.repair_log = Arc::new(log);
         // Reconstruction may have found a different trailer: (re)authenticate against it.
         if (!ok || !authenticated)
@@ -925,8 +926,8 @@ impl Document {
     pub fn xref_entry_is_exact(&self, num: u32) -> bool {
         match self.xref_entry(num) {
             None | Some(XrefEntry::Free { .. }) => true,
-            Some(XrefEntry::InFile { offset, .. }) => {
-                let at = |off: usize| matches!(parse_indirect_shared(&self.data, off, &|_| None), Ok((id, _)) if id.num == num);
+            Some(XrefEntry::InFile { offset, generation }) => {
+                let at = |off: usize| matches!(parse_indirect_shared(&self.data, off, &|_| None), Ok((id, _)) if id == ObjRef::new(num, generation));
                 // Offsets may count from a header that does not start the file.
                 usize::try_from(offset).is_ok_and(|off| at(off) || (self.header_offset != 0 && at(off.saturating_add(self.header_offset))))
             }
@@ -947,17 +948,101 @@ impl Document {
 
     // ── object access ───────────────────────────────────────────────────────────────────────
 
-    /// Fetch an object by reference. Missing objects and references to a different generation
-    /// are `Null` (ISO 32000-2 §7.3.10).
+    /// Fetch an object by reference. Undefined references are `Null` (ISO 32000-2 §7.3.10).
+    /// A live file slot also accepts its actual header generation when a damaged xref row
+    /// disagrees; the disagreement is recorded in [`Self::repair_log`]. Free slots never do.
     pub fn get(&self, r: ObjRef) -> Arc<Object> {
         self.try_get_reference(r).unwrap_or_else(|_| Arc::new(Object::Null))
     }
 
     fn try_get_reference(&self, r: ObjRef) -> Result<Arc<Object>, CosError> {
-        if r.generation != self.generation(r.num) {
+        let matches = match self.overlay.get(&r.num) {
+            Some(Slot::Set(generation, _)) => r.generation == *generation,
+            Some(Slot::Freed(_)) => false,
+            None => match self.entries.lookup(r.num, &self.data) {
+                Some(XrefEntry::InFile { offset, generation }) => {
+                    r.generation == generation || self.indexed_header_reference(r.num, offset) == Some(r)
+                }
+                Some(XrefEntry::InStream { .. }) => r.generation == 0,
+                None | Some(XrefEntry::Free { .. }) => false,
+            },
+        };
+        if !matches {
             return Ok(Arc::new(Object::Null));
         }
         self.try_get(r.num)
+    }
+
+    /// A repair probe, not a whole-file search: only the indexed header (or the same offset
+    /// relative to a shifted PDF header) can establish this additional generation. A small
+    /// window bounds hostile whitespace/tokens; ordinary xref-matching reads are unchanged.
+    fn indexed_header_reference(&self, num: u32, offset: u64) -> Option<ObjRef> {
+        let at = |off: usize| {
+            let bytes = self.data.get(off..off.saturating_add(128).min(self.data.len()))?;
+            let mut lexer = Lexer::new(bytes, 0);
+            lexer.skip_ws();
+            let number = std::str::from_utf8(lexer.token()).ok()?.parse::<u32>().ok()?;
+            lexer.skip_ws();
+            let generation = std::str::from_utf8(lexer.token()).ok()?.parse::<u16>().ok()?;
+            (number == num && lexer.eat_keyword(b"obj")).then_some(ObjRef::new(number, generation))
+        };
+        let off = usize::try_from(offset).ok()?;
+        at(off).or_else(|| if self.header_offset == 0 { None } else { off.checked_add(self.header_offset).and_then(at) })
+    }
+
+    /// Diagnose once at open so the public immutable repair-log/snapshot API stays intact.
+    /// Visit compact ranges without constructing an object-number vector or parsing bodies.
+    /// This diagnoses retained in-use rows, including damage in earlier revisions. The
+    /// winning entry is checked separately at lookup; diagnosing must not do a chain lookup
+    /// per row, which would multiply this pass by the revision count on hostile inputs.
+    fn note_xref_generation_repairs(&self, log: &mut Vec<String>) {
+        const MAX_NOTES: usize = 256;
+        let mut recorded = HashSet::new();
+        let mut omitted = false;
+        let mut inspect = |num, entry| {
+            let XrefEntry::InFile { offset, generation } = entry else { return true };
+            if recorded.contains(&num) {
+                return true;
+            }
+            let Some(header) = self.indexed_header_reference(num, offset) else { return true };
+            if header.generation == generation {
+                return true;
+            }
+            if recorded.len() == MAX_NOTES {
+                omitted = true;
+                return false;
+            }
+            recorded.insert(num);
+            log.push(format!("object {num}: xref generation {generation} disagrees with object header generation {}", header.generation));
+            true
+        };
+        'scan: {
+            match &*self.entries {
+                XrefIndex::Materialized(entries) => {
+                    for (&num, &entry) in &**entries {
+                        if !inspect(num, entry) {
+                            break 'scan;
+                        }
+                    }
+                }
+                XrefIndex::Compact { revisions, .. } => {
+                    for revision in revisions {
+                        for section in std::iter::once(&revision.primary).chain(revision.hybrid.iter()) {
+                            for num in section.numbers() {
+                                if let Some(entry) = section.lookup(num, &self.data)
+                                    && !inspect(num, entry)
+                                {
+                                    break 'scan;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if omitted {
+            log.push("additional xref/header generation disagreements omitted after 256 objects".into());
+        }
     }
 
     /// Follow a reference if `o` is one; otherwise return `o` itself.
