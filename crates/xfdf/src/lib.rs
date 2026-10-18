@@ -11,7 +11,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
 
@@ -495,7 +495,8 @@ impl<'a> FdfValue<'a> {
     }
 }
 
-struct FdfCopy {
+struct FdfCopy<'a> {
+    doc: &'a Document,
     objects: Vec<Object>,
     numbers: HashMap<ObjRef, u32>,
     pending: Vec<(ObjRef, usize)>,
@@ -503,9 +504,9 @@ struct FdfCopy {
     bytes: usize,
 }
 
-impl FdfCopy {
-    fn new() -> Self {
-        Self { objects: Vec::new(), numbers: HashMap::new(), pending: Vec::new(), nodes: MAX_FDF_OBJECTS, bytes: MAX_FDF_BYTES }
+impl<'a> FdfCopy<'a> {
+    fn new(doc: &'a Document) -> Self {
+        Self { doc, objects: Vec::new(), numbers: HashMap::new(), pending: Vec::new(), nodes: MAX_FDF_OBJECTS, bytes: MAX_FDF_BYTES }
     }
 
     fn charge(&mut self, bytes: usize) -> Result<(), DataError> {
@@ -567,6 +568,25 @@ impl FdfCopy {
         Ok(())
     }
 
+    fn is_source_page(&self, dict: &Dict) -> Result<bool, DataError> {
+        let Some(value) = dict.get(b"Type") else { return Ok(false) };
+        let mut value = FdfValue::resolve(self.doc, value);
+        let mut seen = HashSet::new();
+        for _ in 0..MAX_DEPTH {
+            match value.object() {
+                Object::Name(name) => return Ok(matches!(name.as_slice(), b"Page" | b"Pages")),
+                Object::Ref(reference) => {
+                    if !seen.insert(*reference) {
+                        return Ok(false);
+                    }
+                    value = FdfValue::Indirect(self.doc.get(*reference));
+                }
+                _ => return Ok(false),
+            }
+        }
+        Err(DataError::ExportLimit("64 Type reference levels"))
+    }
+
     fn copy(&mut self, value: &Object, depth: usize) -> Result<Object, DataError> {
         self.charge_value(depth)?;
         Ok(match value {
@@ -591,6 +611,8 @@ impl FdfCopy {
                 }
                 Object::Array(out)
             }
+            // Source page links must not drag page contents or the page tree into an FDF.
+            Object::Dict(dict) if self.is_source_page(dict)? => Object::Null,
             Object::Dict(dict) => Object::Dict(self.dict(dict, depth)?),
             Object::String(s) => {
                 self.charge(s.bytes.len().saturating_mul(4))?;
@@ -638,9 +660,10 @@ impl FdfCopy {
 /// FDF with field values and/or comments (appearances are not carried). Each comment is an
 /// indirect object of the FDF, so a reply's `/IRT` can point at its parent's object there
 /// (§12.7.8.3.1). Nested values are copied and renumbered, including shared or cyclic graphs.
+/// Source `/Page` and `/Pages` dictionaries become null at every copy depth.
 /// Refuses exports above the object, value, direct-depth or data budget instead of losing data.
 pub fn export_fdf(doc: &Document, comments: bool, fields: bool, file: &str) -> Result<Vec<u8>, DataError> {
-    let mut copy = FdfCopy::new();
+    let mut copy = FdfCopy::new(doc);
     copy.charge(file.len().saturating_mul(8))?;
     let mut body: Vec<u8> = b"<< /FDF << ".to_vec();
     // Comment dictionaries, written after the root as objects 2, 3, …

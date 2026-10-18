@@ -1376,3 +1376,99 @@ fn xml_form_import_preserves_text_around_comments_and_instructions() {
         assert_eq!(fields(&original).into_iter().find(|f| f.name == "Name").unwrap().value, vec!["replace me"]);
     }
 }
+
+#[test]
+fn fdf_export_nulls_nested_page_links_without_copying_the_source_page_tree() {
+    for indirect_type in [false, true] {
+        let source = {
+            let mut doc = Document::new_empty();
+            let root = doc.root().unwrap();
+            let tree = doc.get(root).as_dict().unwrap().reference(b"Pages").unwrap();
+            let mut pages = Vec::new();
+            for _ in 0..3 {
+                let contents = doc.add(pdfcraft_cos::Stream::from_raw(
+                    Dict::new(),
+                    b"% source-page-content-must-stay-in-the-PDF\nq 0 g 0 0 10 10 re f Q\n".repeat(1_024),
+                ));
+                let mut page = Dict::new();
+                let page_type = if indirect_type { Object::Ref(doc.add(Object::name("Page"))) } else { Object::name("Page") };
+                page.set(b"Type".to_vec(), page_type);
+                page.set(b"Parent".to_vec(), Object::Ref(tree));
+                page.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 600.into(), 800.into()]));
+                page.set(b"Contents".to_vec(), Object::Ref(contents));
+                pages.push(doc.add(page));
+            }
+            let tree_type = if indirect_type { Object::Ref(doc.add(Object::name("Pages"))) } else { Object::name("Pages") };
+            doc.update_dict(tree, |dict| {
+                dict.set(b"Type".to_vec(), tree_type);
+                dict.set(b"Count".to_vec(), Object::Int(3));
+                dict.set(b"Kids".to_vec(), Object::Array(pages.iter().copied().map(Object::Ref).collect()));
+            })
+            .unwrap();
+            let mut action = Dict::new();
+            action.set(b"S".to_vec(), Object::name("GoTo"));
+            action.set(b"D".to_vec(), Object::Array(vec![Object::Ref(pages[1]), Object::name("Fit")]));
+            let mut extension = Dict::new();
+            extension.set(b"Type".to_vec(), Object::name("PCMetadata"));
+            extension.set(b"Target".to_vec(), Object::Ref(pages[1]));
+            extension.set(b"Label".to_vec(), PdfString::text("retained metadata"));
+            let extension = doc.add(extension);
+            let type_cycle = doc.add(Object::Null);
+            doc.set(type_cycle, Object::Ref(type_cycle));
+            let mut cyclic_type = Dict::new();
+            cyclic_type.set(b"Type".to_vec(), Object::Ref(type_cycle));
+            cyclic_type.set(b"Label".to_vec(), PdfString::text("cyclic type is not a page"));
+            fdf_note_with_data(
+                &mut doc,
+                Object::Array(vec![Object::Dict(action), Object::Ref(extension), Object::Array(vec![Object::Ref(tree)]), Object::Dict(cyclic_type)]),
+            );
+            write_full(&doc, &SaveOptions::default()).unwrap()
+        };
+        let source = Document::open(Arc::new(source)).unwrap();
+        assert!(source.repair_log().is_empty());
+        assert_eq!(pdfcraft_model::pages(&source).len(), 3);
+        let bytes = export_fdf(&source, true, false, "source.pdf").unwrap();
+        assert!(bytes.len() < 4_096, "a comment export must not carry source pages or their content ({} bytes)", bytes.len());
+        let fdf = Document::open(Arc::new(bytes)).unwrap();
+        let data = exported_note_data(&fdf);
+        let data = data.as_array().unwrap();
+        let action = data[0].as_dict().unwrap();
+        assert_eq!(action.name(b"S"), Some(b"GoTo".as_slice()));
+        let destination = action.get(b"D").unwrap().as_array().unwrap();
+        assert_eq!(*fdf.resolve(&destination[0]), Object::Null);
+        assert_eq!(destination[1], Object::name("Fit"));
+        let extension = fdf.resolve(&data[1]);
+        let extension = extension.as_dict().unwrap();
+        assert_eq!(extension.name(b"Type"), Some(b"PCMetadata".as_slice()));
+        assert_eq!(extension.get(b"Target"), Some(&destination[0]), "the excluded page reference remains aliased");
+        assert_eq!(extension.get(b"Label").unwrap().as_string().unwrap().to_text(), "retained metadata");
+        let tree = data[2].as_array().unwrap();
+        assert_eq!(*fdf.resolve(&tree[0]), Object::Null);
+
+        let cyclic_type = data[3].as_dict().unwrap();
+        assert_eq!(cyclic_type.get(b"Label").unwrap().as_string().unwrap().to_text(), "cyclic type is not a page");
+        let type_cycle = cyclic_type.get(b"Type").unwrap();
+        assert_eq!(&*fdf.resolve(type_cycle), type_cycle);
+    }
+}
+
+#[test]
+fn fdf_export_bounds_indirect_type_alias_lookups() {
+    for extra_aliases in [MAX_DEPTH - 1, MAX_DEPTH] {
+        let mut doc = blank();
+        let mut page_type = doc.add(Object::name("Page"));
+        for _ in 0..extra_aliases {
+            page_type = doc.add(Object::Ref(page_type));
+        }
+        let mut page = Dict::new();
+        page.set(b"Type".to_vec(), Object::Ref(page_type));
+        fdf_note_with_data(&mut doc, Object::Dict(page));
+        let exported = export_fdf(&doc, true, false, "");
+        if extra_aliases < MAX_DEPTH {
+            let fdf = Document::open(Arc::new(exported.unwrap())).unwrap();
+            assert_eq!(exported_note_data(&fdf), Object::Null);
+        } else {
+            assert!(matches!(exported, Err(DataError::ExportLimit("64 Type reference levels"))));
+        }
+    }
+}
