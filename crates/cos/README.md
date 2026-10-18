@@ -50,7 +50,15 @@ another. Edits never touch the original bytes.
 - **Every cross-reference form:** classic tables with their quirky subsections, cross-reference
   streams, hybrid-reference files (`/XRefStm`), and object streams.
 - **Repair.** A file whose xref is wrong or missing is reconstructed by scanning for `obj`
-  headers. Repairs are *recorded*, never silent, so the UI can say the file was damaged.
+  headers. Repairs are *recorded*, never silent, so the UI can say the file was damaged. A live
+  in-file reference may match either its xref generation or a same-number object header at
+  that indexed offset; a missing, free, or neither-matching slot still resolves to null.
+  Header probes inspect at most 128 bytes at the indexed and header-relative offsets, without
+  parsing object bodies. On open, disagreements in retained xref revisions are recorded once
+  per object, up to 256 objects plus an omitted-details summary. This diagnostic scan does
+  not expand compact xref ranges; the winning xref entry remains authoritative for free
+  slots. Compressed objects require generation zero and edited overlays require their stored
+  generation. Headers beyond this bounded probe are not additionally recovered.
 - **Tolerant, never fatal.** The lexer works on a byte slice and a position; it allocates nothing
   for skipped data, bounds-checks every index, and caps nesting depth. Malformed input yields
   `CosError`, never a panic — this crate is the first thing a hostile file meets. Exhausted xref entries are skipped with a repair log; exhausted /Size hints allocate unused numbers without overflowing or replacing existing objects.
