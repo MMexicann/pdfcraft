@@ -68,7 +68,13 @@ fn preflight_preserves_repaired_image_references_in_snapshots_and_saves() {
                 }
                 assert_images(&Document::open(Arc::new(incremental)).unwrap(), true, damaged);
                 let full = write_full(changed, &opts).unwrap();
-                assert_images(&Document::open(Arc::new(full)).unwrap(), true, damaged);
+                let reopened = Document::open(Arc::new(full)).unwrap();
+                assert_images(&reopened, true, damaged);
+                if damaged {
+                    let catalog = reopened.get(reopened.root().unwrap());
+                    let catalog = catalog.as_dict().unwrap();
+                    assert_eq!(catalog.reference(b"HeaderImage"), catalog.reference(b"RowImage"), "saved aliases must share one object");
+                }
             }
         }
     }
