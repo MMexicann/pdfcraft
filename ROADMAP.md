@@ -1,5 +1,6 @@
 # PdfCraft roadmap
 
+> **Last reviewed:** 2026-10-20 · **Last updated:** 2026-10-20 · **Change:** patch (M1, #1143: repaired aliases survive preflight, snapshots and normalized saves; retained materialized revisions report generation disagreements; estimates unchanged)
 > **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** minor (M1, #1143: explicit live xref/header generation repair policy and bounded diagnostics; estimates unchanged)
 > **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-15 · **Change:** minor (M1: refresh object-generation reference identity against current upstream; estimates unchanged)
 **Stage: alpha** · next: beta, ~25% (ready for real work 50% → 75%) and ~400–700 h away
@@ -173,6 +174,8 @@ Ranked; detail and the full milestone table in [docs/roadmap.md](docs/roadmap.md
 | 8 | 1.0 polish: performance, right-to-left, missing languages, keyboard-only (M14) | 55–95 |
 
 ## Progress log
+
+- **2026-10-20 (M1, PR #1143 review):** Repair-aware dictionary/preflight edits and snapshot restoration preserve both accepted generations of a damaged live slot. Such edits use the existing full-save fallback; classic and packed rewrites coalesce aliases so page-tree parent links retain one object identity. Explicit generation replacement remains single-generation. Materialized xref diagnostics inspect retained primary and hybrid rows before folding, retaining the 256-object cap plus summary and discarding abandoned-index notes. Synthetic red/green controls cover preflight, undo restoration, equal values, explicit narrowing, encryption packing and four save variants. Estimates unchanged.
 
 - **2026-10-19 (M14, #3373):** The main menu and its long submenus scroll in short windows, keeping their commands reachable. Estimates unchanged.
 

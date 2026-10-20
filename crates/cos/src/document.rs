@@ -95,7 +95,7 @@ struct XrefRevisionSection {
 #[derive(Clone, Debug)]
 enum XrefIndex {
     Compact { revisions: Vec<XrefRevisionSection>, max_num: u32, has_entries: bool },
-    Materialized(Arc<BTreeMap<u32, XrefEntry>>),
+    Materialized(Arc<BTreeMap<u32, XrefEntry>>, Arc<Vec<String>>),
 }
 
 const MAX_COMPACT_XREF_ROWS: usize = 2_000_000;
@@ -240,20 +240,20 @@ impl XrefRevisionSection {
 
 impl XrefIndex {
     fn empty() -> Self {
-        Self::Materialized(Arc::new(BTreeMap::new()))
+        Self::Materialized(Arc::new(BTreeMap::new()), Arc::default())
     }
 
     fn lookup(&self, num: u32, file: &[u8]) -> Option<XrefEntry> {
         match self {
             Self::Compact { revisions, .. } => revisions.iter().find_map(|revision| revision.lookup(num, file)),
-            Self::Materialized(entries) => entries.get(&num).copied(),
+            Self::Materialized(entries, _) => entries.get(&num).copied(),
         }
     }
 
     fn is_empty(&self) -> bool {
         match self {
             Self::Compact { has_entries, .. } => !has_entries,
-            Self::Materialized(entries) => entries.is_empty(),
+            Self::Materialized(entries, _) => entries.is_empty(),
         }
     }
 
@@ -262,20 +262,20 @@ impl XrefIndex {
     fn remove_exhausted(&mut self) -> bool {
         match self {
             Self::Compact { .. } => false,
-            Self::Materialized(entries) => Arc::make_mut(entries).remove(&u32::MAX).is_some(),
+            Self::Materialized(entries, _) => Arc::make_mut(entries).remove(&u32::MAX).is_some(),
         }
     }
 
     fn max_num(&self) -> u32 {
         match self {
             Self::Compact { max_num, .. } => *max_num,
-            Self::Materialized(entries) => entries.keys().next_back().copied().unwrap_or(0),
+            Self::Materialized(entries, _) => entries.keys().next_back().copied().unwrap_or(0),
         }
     }
 
     fn object_numbers(&self, file: &[u8]) -> Vec<u32> {
         match self {
-            Self::Materialized(entries) => {
+            Self::Materialized(entries, _) => {
                 entries.iter().filter_map(|(&num, entry)| (!matches!(entry, XrefEntry::Free { .. })).then_some(num)).collect()
             }
             Self::Compact { revisions, .. } => {
@@ -324,6 +324,9 @@ struct ObjStm {
 #[derive(Clone, Debug, PartialEq)]
 enum Slot {
     Set(u16, Arc<Object>),
+    /// Both generations accepted from a damaged live source slot survive a repair-aware edit.
+    /// A full rewrite is required: a new xref slot cannot encode two generations.
+    RepairedSet(u16, u16, Arc<Object>),
     Freed(u16),
 }
 
@@ -362,6 +365,7 @@ impl ReadState {
                 a == b
                     && match (x, y) {
                         (Slot::Set(g, o), Slot::Set(h, p)) => g == h && Arc::ptr_eq(o, p),
+                        (Slot::RepairedSet(g, a, o), Slot::RepairedSet(h, b, p)) => g == h && a == b && Arc::ptr_eq(o, p),
                         (Slot::Freed(g), Slot::Freed(h)) => g == h,
                         _ => false,
                     }
@@ -733,8 +737,9 @@ impl Document {
     }
 
     /// The next save must rewrite the whole file (see [`Document::require_full_save`]).
+    /// Repair-aware edits retaining two accepted generations cannot use one incremental slot.
     pub fn full_save_required(&self) -> bool {
-        self.full_save
+        self.full_save || self.overlay.values().any(|slot| matches!(slot, Slot::RepairedSet(..)))
     }
 
     /// Security was set or removed since the document was opened (the next save applies it).
@@ -975,9 +980,10 @@ impl Document {
         self.try_get_reference(r).unwrap_or_else(|_| Arc::new(Object::Null))
     }
 
-    fn try_get_reference(&self, r: ObjRef) -> Result<Arc<Object>, CosError> {
-        let matches = match self.overlay.get(&r.num) {
+    fn reference_matches(&self, r: ObjRef) -> bool {
+        match self.overlay.get(&r.num) {
             Some(Slot::Set(generation, _)) => r.generation == *generation,
+            Some(Slot::RepairedSet(generation, alias, _)) => r.generation == *generation || r.generation == *alias,
             Some(Slot::Freed(_)) => false,
             None => match self.entries.lookup(r.num, &self.data) {
                 Some(XrefEntry::InFile { offset, generation }) => {
@@ -986,8 +992,11 @@ impl Document {
                 Some(XrefEntry::InStream { .. }) => r.generation == 0,
                 None | Some(XrefEntry::Free { .. }) => false,
             },
-        };
-        if !matches {
+        }
+    }
+
+    fn try_get_reference(&self, r: ObjRef) -> Result<Arc<Object>, CosError> {
+        if !self.reference_matches(r) {
             return Ok(Arc::new(Object::Null));
         }
         self.try_get(r.num)
@@ -1010,58 +1019,46 @@ impl Document {
         at(off).or_else(|| if self.header_offset == 0 { None } else { off.checked_add(self.header_offset).and_then(at) })
     }
 
-    /// Diagnose once at open so the public immutable repair-log/snapshot API stays intact.
-    /// Visit compact ranges without constructing an object-number vector or parsing bodies.
-    /// This diagnoses retained in-use rows, including damage in earlier revisions. The
-    /// winning entry is checked separately at lookup; diagnosing must not do a chain lookup
-    /// per row, which would multiply this pass by the revision count on hostile inputs.
+    /// Add at most one bounded diagnostic per object. False stops diagnostic probing only;
+    /// parsers must still read the remaining xref rows needed to build their index.
+    fn inspect_xref_generation_repair(&self, num: u32, entry: XrefEntry, recorded: &mut HashSet<u32>, log: &mut Vec<String>) -> bool {
+        let XrefEntry::InFile { offset, generation } = entry else { return true };
+        if recorded.contains(&num) {
+            return true;
+        }
+        let Some(header) = self.indexed_header_reference(num, offset) else { return true };
+        if header.generation == generation {
+            return true;
+        }
+        if recorded.len() == 256 {
+            log.push("additional xref/header generation disagreements omitted after 256 objects".into());
+            return false;
+        }
+        recorded.insert(num);
+        log.push(format!("object {num}: xref generation {generation} disagrees with object header generation {}", header.generation));
+        true
+    }
+
+    /// Diagnose once at open without expanding compact ranges or decoding an xref twice.
+    /// Materialized readers retain bounded notes while they read accepted sections, before
+    /// newer rows hide older ones. Discarded parse attempts/rebuilt indexes carry no notes.
     fn note_xref_generation_repairs(&self, log: &mut Vec<String>) {
-        const MAX_NOTES: usize = 256;
-        let mut recorded = HashSet::new();
-        let mut omitted = false;
-        let mut inspect = |num, entry| {
-            let XrefEntry::InFile { offset, generation } = entry else { return true };
-            if recorded.contains(&num) {
-                return true;
-            }
-            let Some(header) = self.indexed_header_reference(num, offset) else { return true };
-            if header.generation == generation {
-                return true;
-            }
-            if recorded.len() == MAX_NOTES {
-                omitted = true;
-                return false;
-            }
-            recorded.insert(num);
-            log.push(format!("object {num}: xref generation {generation} disagrees with object header generation {}", header.generation));
-            true
-        };
-        'scan: {
-            match &*self.entries {
-                XrefIndex::Materialized(entries) => {
-                    for (&num, &entry) in &**entries {
-                        if !inspect(num, entry) {
-                            break 'scan;
-                        }
-                    }
-                }
-                XrefIndex::Compact { revisions, .. } => {
-                    for revision in revisions {
-                        for section in std::iter::once(&revision.primary).chain(revision.hybrid.iter()) {
-                            for num in section.numbers() {
-                                if let Some(entry) = section.lookup(num, &self.data)
-                                    && !inspect(num, entry)
-                                {
-                                    break 'scan;
-                                }
+        match &*self.entries {
+            XrefIndex::Materialized(_, notes) => log.extend(notes.iter().cloned()),
+            XrefIndex::Compact { revisions, .. } => {
+                let mut recorded = HashSet::new();
+                for revision in revisions {
+                    for section in std::iter::once(&revision.primary).chain(revision.hybrid.iter()) {
+                        for num in section.numbers() {
+                            if let Some(entry) = section.lookup(num, &self.data)
+                                && !self.inspect_xref_generation_repair(num, entry, &mut recorded, log)
+                            {
+                                return;
                             }
                         }
                     }
                 }
             }
-        }
-        if omitted {
-            log.push("additional xref/header generation disagreements omitted after 256 objects".into());
         }
     }
 
@@ -1080,7 +1077,7 @@ impl Document {
 
     pub fn try_get(&self, num: u32) -> Result<Arc<Object>, CosError> {
         match self.overlay.get(&num) {
-            Some(Slot::Set(_, o)) => return Ok(o.clone()),
+            Some(Slot::Set(_, o) | Slot::RepairedSet(_, _, o)) => return Ok(o.clone()),
             Some(Slot::Freed(_)) => return Ok(Arc::new(Object::Null)),
             None => {}
         }
@@ -1339,6 +1336,38 @@ impl Document {
         }
     }
 
+    /// Replace an accepted existing reference without losing a damaged source slot's aliases.
+    /// Unlike [`Self::set`], this preserves both xref/header generations when they disagree.
+    /// Such an edit forces a full rewrite so the output has consistent references, rather than
+    /// appending a new contradictory xref row. Missing, free and stale references are errors.
+    pub fn set_existing(&mut self, r: ObjRef, obj: impl Into<Object>) -> Result<(), CosError> {
+        if !self.reference_matches(r) {
+            return Err(CosError::MissingObject(r.num));
+        }
+        let alias = self.alternate_generation(r);
+        if let Some(alias) = alias {
+            let obj = self.adopt(obj.into());
+            self.overlay.insert(r.num, Slot::RepairedSet(r.generation, alias, Arc::new(obj)));
+        } else {
+            self.set(r, obj);
+        }
+        Ok(())
+    }
+
+    /// Other accepted generation for a known-live reference to a damaged slot.
+    fn alternate_generation(&self, r: ObjRef) -> Option<u16> {
+        match self.overlay.get(&r.num) {
+            Some(Slot::RepairedSet(generation, alias, _)) => Some(if r.generation == *generation { *alias } else { *generation }),
+            Some(_) => None,
+            None => match self.entries.lookup(r.num, &self.data) {
+                Some(XrefEntry::InFile { offset, generation }) => self.indexed_header_reference(r.num, offset).and_then(|header| {
+                    (header.generation != generation).then_some(if r.generation == generation { header.generation } else { generation })
+                }),
+                _ => None,
+            },
+        }
+    }
+
     /// Add a new indirect object and return its reference.
     pub fn add(&mut self, obj: impl Into<Object>) -> ObjRef {
         let r = ObjRef::new(self.allocate_num(), 0);
@@ -1386,6 +1415,7 @@ impl Document {
                 let generation = current.generation(num);
                 let same = saved_nums.binary_search(&num).is_ok()
                     && self.generation(num) == generation
+                    && self.alternate_generation(ObjRef::new(num, generation)) == current.alternate_generation(ObjRef::new(num, generation))
                     && saved_reader.try_get(ObjRef::new(num, generation))? == current_reader.try_get(ObjRef::new(num, generation))?;
                 if !same {
                     changed.push(num);
@@ -1400,7 +1430,13 @@ impl Document {
         for num in changed {
             let generation = current.generation(num);
             let object = current_reader.try_get(ObjRef::new(num, generation))?;
-            self.set(ObjRef::new(num, generation), (*object).clone());
+            if let Some(alias) = current.alternate_generation(ObjRef::new(num, generation)) {
+                let object = self.adopt((*object).clone());
+                self.overlay.insert(num, Slot::RepairedSet(generation, alias, Arc::new(object)));
+                self.next_num = self.next_num.max(num.saturating_add(1));
+            } else {
+                self.set(ObjRef::new(num, generation), (*object).clone());
+            }
         }
         *self.trailer_mut() = current.trailer().clone();
         Ok(())
@@ -1411,14 +1447,13 @@ impl Document {
         let mut obj = (*self.get(r)).clone();
         let d = obj.as_dict_mut().ok_or(CosError::NotADictionary(r))?;
         f(d);
-        self.set(r, obj);
-        Ok(())
+        self.set_existing(r, obj)
     }
 
     /// Current generation of an object number.
     pub fn generation(&self, num: u32) -> u16 {
         match self.overlay.get(&num) {
-            Some(Slot::Set(g, _)) => *g,
+            Some(Slot::Set(g, _) | Slot::RepairedSet(g, _, _)) => *g,
             Some(Slot::Freed(g)) => *g,
             None => match self.entries.lookup(num, &self.data) {
                 Some(XrefEntry::InFile { generation, .. }) => generation,
@@ -1430,7 +1465,7 @@ impl Document {
 
     pub(crate) fn overlay_entries(&self) -> impl Iterator<Item = (u32, u16, Option<Arc<Object>>)> + '_ {
         self.overlay.iter().map(|(n, s)| match s {
-            Slot::Set(g, o) => (*n, *g, Some(o.clone())),
+            Slot::Set(g, o) | Slot::RepairedSet(g, _, o) => (*n, *g, Some(o.clone())),
             Slot::Freed(g) => (*n, *g, None),
         })
     }
@@ -1453,7 +1488,7 @@ impl Document {
             if source.peek().is_some_and(|n| *n == num) {
                 source.next();
             }
-            if matches!(slot, Slot::Set(..)) {
+            if matches!(slot, Slot::Set(..) | Slot::RepairedSet(..)) {
                 numbers.push(num);
             }
         }
@@ -1485,8 +1520,8 @@ impl Document {
                 return Ok((index, trailer, revisions, Vec::new()));
             }
         }
-        let (entries, trailer, revisions, oddities) = self.read_xref_chain_materialized(log)?;
-        Ok((XrefIndex::Materialized(Arc::new(entries)), trailer, revisions, oddities))
+        let (entries, trailer, revisions, oddities, generation_repairs) = self.read_xref_chain_materialized(log)?;
+        Ok((XrefIndex::Materialized(Arc::new(entries), Arc::new(generation_repairs)), trailer, revisions, oddities))
     }
 
     fn read_compact_xref_chain(&self, log: &mut Vec<String>) -> Result<Option<(XrefIndex, Dict, Vec<Revision>)>, CosError> {
@@ -1791,7 +1826,7 @@ impl Document {
     fn read_xref_chain_materialized(
         &self,
         log: &mut Vec<String>,
-    ) -> Result<(BTreeMap<u32, XrefEntry>, Dict, Vec<Revision>, Vec<(u64, u32)>), CosError> {
+    ) -> Result<(BTreeMap<u32, XrefEntry>, Dict, Vec<Revision>, Vec<(u64, u32)>, Vec<String>), CosError> {
         let data = &self.data;
         let tail_start = data.len().saturating_sub(4096);
         let sx = rfind(data, b"startxref", tail_start).ok_or(CosError::Syntax { offset: data.len(), detail: "no startxref".into() })?;
@@ -1805,6 +1840,9 @@ impl Document {
         let mut revisions = Vec::new();
         let mut oddities = Vec::new();
         let mut visited = HashSet::new();
+        let mut generation_repairs = Vec::new();
+        let mut recorded = HashSet::new();
+        let mut diagnose = true;
         let mut next = Some(first);
         while let Some(off) = next.take() {
             if !visited.insert(off) || visited.len() > 10_000 {
@@ -1833,12 +1871,24 @@ impl Document {
                 }
             };
             revisions.push(Revision { xref_offset: off, is_stream, header_relative });
+            for (&num, &entry) in &sect {
+                if !diagnose {
+                    break;
+                }
+                diagnose = self.inspect_xref_generation_repair(num, entry, &mut recorded, &mut generation_repairs);
+            }
             // Hybrid files (§7.5.8.4): the /XRefStm entries supplement the table and replace the
             // free entries it gives objects only a cross-reference stream can locate.
             if let Some(x) = sect_trailer.int(b"XRefStm").filter(|x| *x >= 0) {
                 let mut stm = BTreeMap::new();
                 match self.read_section(x as usize, &mut stm, &mut odd, log) {
                     Ok(_) => {
+                        for (&num, &entry) in &stm {
+                            if !diagnose {
+                                break;
+                            }
+                            diagnose = self.inspect_xref_generation_repair(num, entry, &mut recorded, &mut generation_repairs);
+                        }
                         for (num, e) in stm {
                             match sect.get(&num) {
                                 None | Some(XrefEntry::Free { .. }) => {
@@ -1867,7 +1917,7 @@ impl Document {
         for k in [&b"Prev"[..], b"XRefStm", b"Type", b"W", b"Index", b"Filter", b"DecodeParms", b"Length"] {
             trailer.remove(k);
         }
-        Ok((entries, trailer, revisions, oddities))
+        Ok((entries, trailer, revisions, oddities, generation_repairs))
     }
 
     /// Read one section at `off`, adding entries not already known (newer sections win). `odd`
@@ -2029,7 +2079,7 @@ impl Document {
         if entries.is_empty() {
             return Err(CosError::Syntax { offset: 0, detail: "no objects found".into() });
         }
-        self.entries = Arc::new(XrefIndex::Materialized(Arc::new(entries.clone())));
+        self.entries = Arc::new(XrefIndex::Materialized(Arc::new(entries.clone()), Arc::default()));
         self.cache.lock().map_err(|_| CosError::Poisoned)?.clear();
         // Objects inside object streams.
         for num in objstms {
@@ -2044,7 +2094,7 @@ impl Document {
             }
         }
         let object_count = entries.len();
-        self.entries = Arc::new(XrefIndex::Materialized(Arc::new(entries)));
+        self.entries = Arc::new(XrefIndex::Materialized(Arc::new(entries), Arc::default()));
         self.cache.lock().map_err(|_| CosError::Poisoned)?.clear();
         // Trailer: the last `trailer` dictionary with a usable /Root, else the catalog itself.
         let mut trailer = None;
@@ -2194,7 +2244,7 @@ mod tests {
 
     fn assert_compact_matches_materialized(doc: &Document) {
         assert!(matches!(doc.entries.as_ref(), XrefIndex::Compact { .. }), "valid xrefs should not retain a per-entry map");
-        let (entries, _, revisions, _) = doc.read_xref_chain_materialized(&mut Vec::new()).unwrap();
+        let (entries, _, revisions, _, _) = doc.read_xref_chain_materialized(&mut Vec::new()).unwrap();
         assert_eq!(revisions.as_slice(), doc.revisions());
         let max = entries.keys().next_back().copied().unwrap_or(0);
         assert_eq!(doc.entries.max_num(), max);
@@ -2282,7 +2332,7 @@ mod tests {
         let at = bytes.windows(marker.len()).position(|window| window == marker).unwrap();
         bytes[at..at + marker.len()].copy_from_slice(b"/Size 2");
         let doc = Document::open(Arc::new(bytes)).unwrap();
-        assert!(matches!(doc.entries.as_ref(), XrefIndex::Materialized(_)));
+        assert!(matches!(doc.entries.as_ref(), XrefIndex::Materialized(..)));
         assert_eq!(doc.next_num, 4);
         assert_eq!(doc.object_numbers(), vec![1, 2, 3]);
     }
@@ -2562,15 +2612,18 @@ endobj
     fn object_numbers_merge_source_and_overlay_in_order() {
         let mut doc = Document::new_empty();
         doc.overlay.clear();
-        doc.entries = Arc::new(XrefIndex::Materialized(Arc::new(BTreeMap::from([
-            (0, XrefEntry::Free { next_generation: 65535 }),
-            (2, XrefEntry::InFile { offset: 10, generation: 7 }),
-            (4, XrefEntry::Free { next_generation: 9 }),
-            (6, XrefEntry::InStream { stream: 80, index: 1 }),
-            (8, XrefEntry::InFile { offset: 20, generation: 5 }),
-            (10, XrefEntry::InFile { offset: 30, generation: 3 }),
-            (u32::MAX, XrefEntry::InFile { offset: 40, generation: 1 }),
-        ]))));
+        doc.entries = Arc::new(XrefIndex::Materialized(
+            Arc::new(BTreeMap::from([
+                (0, XrefEntry::Free { next_generation: 65535 }),
+                (2, XrefEntry::InFile { offset: 10, generation: 7 }),
+                (4, XrefEntry::Free { next_generation: 9 }),
+                (6, XrefEntry::InStream { stream: 80, index: 1 }),
+                (8, XrefEntry::InFile { offset: 20, generation: 5 }),
+                (10, XrefEntry::InFile { offset: 30, generation: 3 }),
+                (u32::MAX, XrefEntry::InFile { offset: 40, generation: 1 }),
+            ])),
+            Arc::default(),
+        ));
         doc.set(ObjRef::new(1, 2), Object::Int(1)); // before the first live source slot
         doc.set(ObjRef::new(2, 8), Object::Int(2)); // override, without duplication
         doc.set(ObjRef::new(4, 9), Object::Int(4)); // reuse a source free slot
