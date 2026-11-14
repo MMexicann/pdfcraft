@@ -5806,7 +5806,13 @@ fn redact_mark_respects_single_page_and_rejects_conflicting_selectors() {
     let mut a = auto(&dir);
     let doc = ok(&mut a, "doc_create", json!({ "from": "text", "path": "memo.txt" }))["doc"].as_u64().unwrap();
     ok(&mut a, "page_duplicate", json!({ "doc": doc, "pages": [1] }));
-    for selector in [json!({ "find": "Private" }), json!({ "words": ["Private"] }), json!({ "pattern": "ssn" }), json!({ "whole_pages": true })] {
+    for selector in [
+        json!({ "find": "Private" }),
+        json!({ "words": ["Private"] }),
+        json!({ "pattern": "ssn" }),
+        json!({ "whole_pages": true }),
+        json!({ "rect": [-0.5, 1.25, 10.5, 10.75] }),
+    ] {
         let mut args = selector;
         args["doc"] = json!(doc);
         args["page"] = json!(1);
@@ -5817,6 +5823,9 @@ fn redact_mark_respects_single_page_and_rejects_conflicting_selectors() {
     for args in [
         json!({ "doc": doc, "find": "Private", "page": 1, "pages": [2] }),
         json!({ "doc": doc, "rect": [1, 1, 10, 10], "pages": [2] }),
+        json!({ "doc": doc, "page": 1, "rect": [1, 1, false, 10, 10] }),
+        json!({ "doc": doc, "page": 1, "rect": [1, 1, "bad", 10, 10] }),
+        json!({ "doc": doc, "page": 1, "rect": [1, 1, null, 10, 10] }),
         json!({ "doc": doc, "find": "Private", "page": 3 }),
     ] {
         assert!(matches!(a.call("redact_mark", &args), Err(ToolError::InvalidArgs(_))));
@@ -6400,6 +6409,31 @@ fn adding_content_through_tools() {
     let list = ok(&mut a, "content_list", json!({ "doc": doc }));
     assert_eq!(list["count"], 2);
     assert_eq!((list["items"][0]["type"].as_str(), list["items"][0]["bold"].as_bool()), (Some("text"), Some(true)));
+    let objects = ok(&mut a, "object_list", json!({"doc":doc,"page":1}));
+    for (tool, args) in [
+        ("page_add_text", json!({"doc":doc,"page":1,"text":"unwanted","at":[20,false,20]})),
+        ("page_add_text", json!({"doc":doc,"page":1,"text":"unwanted","rect":[20,20,"bad",80,40]})),
+        ("page_add_image", json!({"doc":doc,"page":1,"path":"logo.png","rect":[100,200,null,180,240]})),
+        ("content_update", json!({"doc":doc,"page":1,"index":2,"rect":[100,false,200,180,240]})),
+        ("content_update", json!({"doc":doc,"page":1,"index":2,"crop":[0.1,0,false,0.1,0]})),
+    ] {
+        assert!(matches!(a.call(tool, &args), Err(ToolError::InvalidArgs(_))), "{tool}: {args}");
+        assert_eq!(ok(&mut a, "content_list", json!({"doc":doc})), list, "{tool}: {args}");
+        assert_eq!(ok(&mut a, "object_list", json!({"doc":doc,"page":1})), objects, "{tool}: no edit generation may change");
+    }
+    // Negative and fractional positions remain valid; only malformed entries are refused.
+    ok(&mut a, "page_add_text", json!({"doc":doc,"page":1,"text":"position","at":[-0.5,20.25]}));
+    let positioned = ok(&mut a, "content_list", json!({"doc":doc}));
+    assert_eq!(positioned["items"][2]["rect"][0], -0.5);
+    assert_eq!(positioned["items"][2]["rect"][1], 20.25);
+    assert_eq!(positioned["items"][2]["rect"][2], 199.5);
+    ok(&mut a, "content_delete", json!({"doc":doc,"page":1,"index":3}));
+    ok(&mut a, "content_update", json!({"doc":doc,"page":1,"index":1,"rect":[-0.5,20.25,199.5,40.25]}));
+    let positioned = ok(&mut a, "content_list", json!({"doc":doc}));
+    assert_eq!(positioned["items"][0]["rect"][0], -0.5);
+    assert_eq!(positioned["items"][0]["rect"][1], 20.25);
+    assert_eq!(positioned["items"][0]["rect"][2], 199.5);
+    ok(&mut a, "content_update", json!({"doc":doc,"page":1,"index":1,"rect":[20,20,220,40]}));
     ok(&mut a, "content_update", json!({ "doc": doc, "page": 1, "index": 1, "text": "DRAFT", "font": "times" }));
     let text = page_text(&mut a, doc)[0].clone();
     assert!(text.contains("DRAFT") && !text.contains("CONFIDENTIAL"), "{text}");
