@@ -183,13 +183,8 @@ mod missing_value_tests {
     #[test]
     fn commands_refuse_a_missing_operand_before_reading_or_scanning() {
         let dir = ValueDir::new();
-        for (command, option) in [
-            ("info", "--password"),
-            ("audit", "--password"),
-            ("check-one", "--dpi"),
-            ("check", "--dpi"),
-            ("check", "--timeout"),
-        ] {
+        for (command, option) in [("info", "--password"), ("audit", "--password"), ("check-one", "--dpi"), ("check", "--dpi"), ("check", "--timeout")]
+        {
             let out = Command::new(BIN).current_dir(&dir.0).args([command, "missing.pdf", option]).output().unwrap();
             assert_eq!(out.status.code(), Some(1), "{command} {option}: {out:?}");
             assert!(out.stdout.is_empty(), "{command} {option}: no file record may be printed");
