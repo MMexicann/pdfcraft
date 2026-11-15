@@ -47,6 +47,15 @@ fn audit_rectangles_match_the_tool_in_top_left_points() {
     assert!(!out.status.success(), "findings must fail the audit");
     let cli: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(cli["count"], 2, "{cli}");
+    #[cfg(target_os = "linux")]
+    {
+        let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let failed = Command::new(BIN).arg("audit").arg(dir.join("faux.pdf")).stdout(full).output().unwrap();
+        assert_eq!(failed.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+        assert!(stderr.contains("audit: 2 faux redaction(s) found"), "{stderr}");
+        assert!(stderr.contains("stdout:"), "{stderr}");
+    }
     // Page 1 upright: y measured down from the top of the 792 pt page. Page 2 turned a quarter
     // clockwise: 792 pt wide, and the cover's user-space y becomes its x.
     let expected = [serde_json::json!([90.0, 72.0, 310.0, 104.0]), serde_json::json!([688.0, 90.0, 720.0, 310.0])];
