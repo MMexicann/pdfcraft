@@ -9293,6 +9293,13 @@ fn initial_view_through_tools() {
     let v = &r["initial_view"];
     assert_eq!((v["navigation"].as_str(), v["magnification"].as_str(), v["page"].as_u64()), (Some("Pages"), Some("Percent(150.0)"), Some(2)));
     assert_eq!((v["language"].as_str(), v["binding"].as_str()), (Some("en-GB"), Some("right")));
+    let before = r["initial_view"].clone();
+    let generation = a.session().get(pdfcraft_engine::DocId(doc)).unwrap().edit_generation();
+    for page in [0, -1, i64::MIN] {
+        assert!(matches!(a.call("doc_initial_view", &json!({ "doc": doc, "page": page })), Err(ToolError::InvalidArgs(_))));
+        assert_eq!(ok(&mut a, "doc_initial_view", json!({ "doc": doc }))["initial_view"], before);
+        assert_eq!(a.session().get(pdfcraft_engine::DocId(doc)).unwrap().edit_generation(), generation);
+    }
     assert_eq!(ok(&mut a, "edit_undo", json!({ "doc": doc }))["undone"], "Change initial view");
     assert!(matches!(a.call("doc_initial_view", &json!({ "doc": doc, "layout": "spiral" })), Err(ToolError::InvalidArgs(_))));
     assert!(matches!(a.call("doc_initial_view", &json!({ "doc": doc, "page": 9 })), Err(ToolError::Failed(_))));
@@ -9670,9 +9677,30 @@ fn field_actions_through_tools() {
     assert_eq!(r["actions"][0], json!({ "trigger": "mouse_up", "javascript": "this.pageNum = 2;" }));
     assert_eq!(r["actions"][1], json!({ "trigger": "mouse_enter", "hide": ["Go"] }));
     assert_eq!(r["actions"][2], json!({ "trigger": "on_focus", "page": 3 }));
+    let before = ok(&mut a, "form_actions", json!({ "doc": doc, "field": "Go" }));
+    let generation = a.session().get(pdfcraft_engine::DocId(doc)).unwrap().edit_generation();
+    for key in ["reset", "show", "hide"] {
+        for value in [json!(null), json!(false), json!("Go"), json!([false]), json!(["Go", false])] {
+            let mut action = json!({ "trigger": "mouse_up" });
+            action[key] = value;
+            assert!(matches!(
+                a.call("form_set_actions", &json!({ "doc": doc, "field": "Go", "actions": [action] })),
+                Err(ToolError::InvalidArgs(_))
+            ));
+            assert_eq!(ok(&mut a, "form_actions", json!({ "doc": doc, "field": "Go" })), before);
+            assert_eq!(a.session().get(pdfcraft_engine::DocId(doc)).unwrap().edit_generation(), generation);
+        }
+    }
     let run = ok(&mut a, "js_run", json!({ "doc": doc, "script": "this.pageNum = 2;", "field": "Go" }));
     assert_eq!(run["requests"][0]["page"], 3);
     assert!(a.call("form_set_actions", &json!({ "doc": doc, "field": "Go", "actions": [{ "trigger": "wave" }] })).is_err());
+    let actions = json!([
+        { "trigger": "mouse_up", "reset": [] },
+        { "trigger": "mouse_enter", "reset": ["Go"] },
+        { "trigger": "on_focus", "show": ["Go"] }
+    ]);
+    let accepted = ok(&mut a, "form_set_actions", json!({ "doc": doc, "field": "Go", "actions": actions }));
+    assert_eq!(accepted["actions"], actions);
 }
 
 #[test]
