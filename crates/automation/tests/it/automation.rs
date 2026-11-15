@@ -2747,6 +2747,13 @@ fn edit_text_comment(a: &mut Automation, doc: u64, original_list: &Value) {
 }
 
 fn verify_comment_errors(a: &mut Automation, doc: u64, id: &str) {
+    let before = ok(a, "comment_list", json!({ "doc": doc }));
+    let generation = a.session().get(pdfcraft_engine::DocId(doc)).unwrap().edit_generation();
+    for (page, index) in [(0, 1), (-1, 1), (1, 0), (1, -1), (i64::MIN, 1), (1, i64::MIN)] {
+        assert!(matches!(a.call("comment_delete", &json!({ "doc": doc, "page": page, "index": index })), Err(ToolError::InvalidArgs(_))));
+        assert_eq!(ok(a, "comment_list", json!({ "doc": doc })), before, "invalid positions must not delete another comment");
+        assert_eq!(a.session().get(pdfcraft_engine::DocId(doc)).unwrap().edit_generation(), generation);
+    }
     ok(a, "comment_delete", json!({ "doc": doc, "id": id }));
     assert_eq!(ok(a, "comment_list", json!({ "doc": doc }))["count"], 5);
     assert!(matches!(a.call("comment_delete", &json!({ "doc": doc, "id": id })), Err(ToolError::Failed(_))));
@@ -9683,10 +9690,7 @@ fn field_actions_through_tools() {
         for value in [json!(null), json!(false), json!("Go"), json!([false]), json!(["Go", false])] {
             let mut action = json!({ "trigger": "mouse_up" });
             action[key] = value;
-            assert!(matches!(
-                a.call("form_set_actions", &json!({ "doc": doc, "field": "Go", "actions": [action] })),
-                Err(ToolError::InvalidArgs(_))
-            ));
+            assert!(matches!(a.call("form_set_actions", &json!({ "doc": doc, "field": "Go", "actions": [action] })), Err(ToolError::InvalidArgs(_))));
             assert_eq!(ok(&mut a, "form_actions", json!({ "doc": doc, "field": "Go" })), before);
             assert_eq!(a.session().get(pdfcraft_engine::DocId(doc)).unwrap().edit_generation(), generation);
         }
