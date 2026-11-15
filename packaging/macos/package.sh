@@ -21,7 +21,13 @@ ARCH=universal
 SKIP_BUILD=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --arch) ARCH="$2"; shift 2 ;;
+    --arch)
+      if [[ $# -lt 2 || "$2" == --* ]]; then
+        echo "error: --arch needs universal, aarch64 or x86_64" >&2
+        exit 2
+      fi
+      ARCH="$2"; shift 2
+      ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     -h | --help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
